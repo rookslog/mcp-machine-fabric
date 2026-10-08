@@ -183,7 +183,9 @@ async function commandLine(pid: number): Promise<string | null> {
 
   if (platform() === "darwin") {
     try {
-      const { stdout } = await execFileAsync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+      const { stdout } = await execFileAsync("ps", ["-ww", "-o", "command=", "-p", String(pid)], {
+        encoding: "utf8",
+      });
       return stdout;
     } catch {
       return null;
@@ -462,22 +464,33 @@ export class JobManager {
   async #record(jobId: string, meta: JobMeta): Promise<JobRecord> {
     const jobDir = this.#jobDir(jobId);
     const pid = parsePid(await readOptional(path.join(jobDir, "pid")));
-    const exitText = await readOptional(path.join(jobDir, "exit_code"));
-    const cancelled = await readOptional(path.join(jobDir, "cancelled"));
+    const exitPath = path.join(jobDir, "exit_code");
+    const cancelledPath = path.join(jobDir, "cancelled");
+    let exitText = await readOptional(exitPath);
+    let cancelled = await readOptional(cancelledPath);
     let status: JobStatus;
     let exitCode: number | null = null;
     let endedAt: string | null = null;
+
+    const owned = exitText === null && pid !== null && (await isOwnedWrapper(pid, jobDir));
+    if (exitText === null && !owned) {
+      // Ownership checks are slower than file reads (and invoke ps on macOS).
+      // The wrapper can publish exit_code and disappear between those two
+      // observations, so refresh terminal markers before declaring it lost.
+      exitText = await readOptional(exitPath);
+      cancelled = await readOptional(cancelledPath);
+    }
 
     if (exitText !== null) {
       const parsed = Number.parseInt(exitText.trim(), 10);
       exitCode = Number.isSafeInteger(parsed) ? parsed : null;
       status = "exited";
-      endedAt = (await stat(path.join(jobDir, "exit_code"))).mtime.toISOString();
-    } else if (pid !== null && (await isOwnedWrapper(pid, jobDir))) {
+      endedAt = (await stat(exitPath)).mtime.toISOString();
+    } else if (owned) {
       status = "running";
     } else if (cancelled !== null) {
       status = "killed";
-      endedAt = (await stat(path.join(jobDir, "cancelled"))).mtime.toISOString();
+      endedAt = (await stat(cancelledPath)).mtime.toISOString();
     } else {
       status = "lost";
       const pidStat = await stat(path.join(jobDir, "pid")).catch(() => null);
