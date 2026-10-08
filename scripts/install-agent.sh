@@ -143,7 +143,7 @@ fi
 [[ "$platform_name" == linux || "$platform_name" == darwin ]] || die "--platform must be linux or darwin"
 [[ -n "$prefix" ]] || die "--prefix must not be empty"
 
-for root in "${roots[@]}"; do
+for root in ${roots[@]+"${roots[@]}"}; do
   [[ "$root" != *:* ]] || die "root paths cannot contain ':' because MMF_ROOTS is colon-separated"
   [[ "$root" != *$'\n'* && "$root" != *$'\r'* ]] || die "root paths cannot contain newlines"
 done

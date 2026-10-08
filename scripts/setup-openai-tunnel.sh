@@ -167,7 +167,7 @@ rollback_install() {
   else
     PRESERVE_RECOVERY=1
     echo "Installation failed and recovery was incomplete for:" >&2
-    printf '  %s\n' "${failures[@]}" >&2
+    printf '  %s\n' ${failures[@]+"${failures[@]}"} >&2
     echo "Recovery files preserved at: $BACKUP_DIR" >&2
   fi
   revoke_new_token
