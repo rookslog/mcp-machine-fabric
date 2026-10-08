@@ -1,0 +1,12 @@
+.git
+.github
+node_modules
+dist
+coverage
+test
+docs
+deploy
+scripts
+*.tgz
+*.log
+.DS_Store

@@ -3,12 +3,23 @@
   "version": "0.1.0",
   "description": "Self-hosted, open-source remote machine control for MCP clients: one hub, many outbound agents, durable jobs, auditable requests.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rookslog/mcp-machine-fabric.git"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "remote-control",
+    "self-hosted",
+    "automation"
+  ],
   "type": "module",
   "bin": {
     "mmf": "dist/cli.js"
   },
   "files": [
-    "dist",
+    "dist/**/*.js",
     "README.md",
     "LICENSE"
   ],
@@ -17,6 +28,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "postbuild": "chmod 755 dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
