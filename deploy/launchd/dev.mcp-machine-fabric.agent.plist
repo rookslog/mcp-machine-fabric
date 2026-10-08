@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Template: scripts/install-agent.sh fills @NODE@, @HOME@, @HUB_URL@. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>dev.mcp-machine-fabric.agent</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@NODE@</string>
+    <string>@HOME@/.local/opt/mcp-machine-fabric/current/dist/cli.js</string>
+    <string>agent</string>
+    <string>--hub</string><string>@HUB_URL@</string>
+    <string>--token-file</string><string>@HOME@/.config/mmf/agent.token</string>
+  </array>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>@PATH@</string></dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <!-- Durable jobs run in their own process groups; never reap them when the agent exits. -->
+  <key>AbandonProcessGroup</key><true/>
+  <key>ProcessType</key><string>Background</string>
+  <key>StandardOutPath</key><string>@HOME@/Library/Logs/mmf-agent.log</string>
+  <key>StandardErrorPath</key><string>@HOME@/Library/Logs/mmf-agent.log</string>
+</dict>
+</plist>

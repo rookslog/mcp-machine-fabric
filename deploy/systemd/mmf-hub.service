@@ -1,0 +1,20 @@
+# User unit: install to ~/.config/systemd/user/, then
+#   systemctl --user daemon-reload && systemctl --user enable --now mmf-hub
+# Requires `loginctl enable-linger $USER` to run without a login session.
+[Unit]
+Description=MCP Machine Fabric hub
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/mmf/hub.env
+ExecStart=/usr/bin/env node %h/.local/opt/mcp-machine-fabric/current/dist/cli.js hub
+Restart=always
+RestartSec=2s
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

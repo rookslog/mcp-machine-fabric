@@ -1,0 +1,20 @@
+# User unit: install to ~/.config/systemd/user/, then
+#   systemctl --user daemon-reload && systemctl --user enable --now mmf-agent
+[Unit]
+Description=MCP Machine Fabric agent
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-%h/.config/mmf/agent.env
+ExecStart=/usr/bin/env node %h/.local/opt/mcp-machine-fabric/current/dist/cli.js agent --token-file %h/.config/mmf/agent.token
+Restart=always
+RestartSec=2s
+UMask=0077
+# Durable jobs are detached children. KillMode=process makes stop/restart of the
+# agent signal only the agent itself, so running jobs survive agent upgrades.
+KillMode=process
+
+[Install]
+WantedBy=default.target
