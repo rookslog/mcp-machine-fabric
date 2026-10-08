@@ -24,7 +24,8 @@ Agent (run on every machine you want to control):
   mmf agent --hub wss://HUB/agent --token-file FILE [--root DIR ...] [--read-only] [--no-exec] [--state-dir DIR]
             (or MMF_AGENT_TOKEN in the environment)
 
-Environment: MMF_DATA_DIR (hub data, default ~/.local/share/mmf-hub), MMF_PUBLIC_URL, MMF_PORT, MMF_HOST.
+Environment: hub: MMF_DATA_DIR (default ~/.local/share/mmf-hub), MMF_PUBLIC_URL, MMF_PORT, MMF_HOST
+             agent: MMF_HUB_URL, MMF_AGENT_TOKEN, MMF_ROOTS (colon-separated), MMF_READ_ONLY=1, MMF_NO_EXEC=1, MMF_STATE_DIR
 `;
 
 function dataDir(flag?: string): string {
@@ -164,10 +165,12 @@ async function main(argv: string[]): Promise<number> {
         console.error("agent needs --hub (or MMF_HUB_URL) and --token-file (or MMF_AGENT_TOKEN)\n\n" + USAGE);
         return 2;
       }
+      const envRoots = process.env.MMF_ROOTS ? process.env.MMF_ROOTS.split(":").filter(Boolean) : undefined;
+      const truthy = (v: string | undefined) => v === "1" || v === "true";
       const policy = await normalizePolicy({
-        roots: values.root,
-        read_only: values["read-only"] ?? false,
-        allow_exec: !(values["no-exec"] ?? false),
+        roots: values.root ?? envRoots,
+        read_only: values["read-only"] ?? truthy(process.env.MMF_READ_ONLY),
+        allow_exec: !(values["no-exec"] ?? truthy(process.env.MMF_NO_EXEC)),
       });
       const log = jsonLogger("agent");
       const stateDir = values["state-dir"] ?? process.env.MMF_STATE_DIR ?? nodePath.join(homedir(), ".local/state/mmf-agent");
