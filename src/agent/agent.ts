@@ -98,8 +98,14 @@ export class Executor {
     }
   }
 
+  /** Explicit cwd must be inside the roots; the default is $HOME, or the first root when $HOME is outside them. */
   private async resolveCwd(cwd: unknown): Promise<string> {
-    return checkPath(this.policy, typeof cwd === "string" && cwd ? cwd : homedir(), "read");
+    if (typeof cwd === "string" && cwd) return checkPath(this.policy, cwd, "read");
+    try {
+      return await checkPath(this.policy, homedir(), "read");
+    } catch {
+      return this.policy.roots[0];
+    }
   }
 
   private async jobTool(tool: string, a: Record<string, any>, onJob?: (jobId: string) => void): Promise<ToolOutcome> {

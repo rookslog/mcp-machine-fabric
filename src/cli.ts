@@ -24,7 +24,7 @@ Agent (run on every machine you want to control):
   mmf agent --hub wss://HUB/agent --token-file FILE [--root DIR ...] [--read-only] [--no-exec] [--state-dir DIR]
             (or MMF_AGENT_TOKEN in the environment)
 
-Environment: hub: MMF_DATA_DIR (default ~/.local/share/mmf-hub), MMF_PUBLIC_URL, MMF_PORT, MMF_HOST
+Environment: hub: MMF_DATA_DIR (default ~/.local/share/mmf-hub), MMF_PUBLIC_URL, MMF_PORT, MMF_HOST (comma-separated addresses)
              agent: MMF_HUB_URL, MMF_AGENT_TOKEN, MMF_ROOTS (colon-separated), MMF_READ_ONLY=1, MMF_NO_EXEC=1, MMF_STATE_DIR
 `;
 
@@ -77,7 +77,7 @@ async function main(argv: string[]): Promise<number> {
         authRouter: createOAuthRouter({ provider, issuerUrl: new URL(pub), mcpResourceUrl: new URL(`${pub}/mcp`), resourceName: "Machine Fabric" }),
         log,
       });
-      const bound = await hub.listen(port, host);
+      const bound = await hub.listen(port, host.split(",").map((h) => h.trim()).filter(Boolean));
       log("hub listening", { host, port: bound, public_url: pub, mcp: `${pub}/mcp`, agent_ws: `${pub.replace(/^http/, "ws")}/agent` });
       const prune = setInterval(() => store.pruneRequests(30 * 24 * 3600 * 1000), 3600 * 1000);
       prune.unref();

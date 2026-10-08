@@ -28,7 +28,8 @@ export interface Hub {
   app: express.Express;
   server: Server;
   registry: Registry;
-  listen(port: number, host: string): Promise<number>;
+  /** Listen on one or more addresses (e.g. loopback plus a tailnet IP). Returns the bound port. */
+  listen(port: number, host: string | string[]): Promise<number>;
   close(): Promise<void>;
 }
 
@@ -120,9 +121,10 @@ export function createHub(opts: HubOptions): Hub {
   app.delete("/mcp", methodNotAllowed);
 
   const server = createServer(app);
+  const extraServers: Server[] = [];
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });
 
-  server.on("upgrade", (req: IncomingMessage, socket: Duplex, head: Buffer) => {
+  const onUpgrade = (req: IncomingMessage, socket: Duplex, head: Buffer) => {
     const url = new URL(req.url ?? "/", "http://hub");
     if (url.pathname !== "/agent") {
       socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
@@ -140,29 +142,42 @@ export function createHub(opts: HubOptions): Hub {
       log("agent connected", { machine: device.name });
       registry.attach(device.name, device.id, ws);
     });
-  });
+  };
+  server.on("upgrade", onUpgrade);
+
+  const listenOne = (srv: Server, port: number, host: string) =>
+    new Promise<number>((resolve, reject) => {
+      srv.once("error", reject);
+      srv.listen(port, host, () => {
+        const addr = srv.address();
+        resolve(typeof addr === "object" && addr ? addr.port : port);
+      });
+    });
 
   return {
     app,
     server,
     registry,
-    listen(port, host) {
-      return new Promise((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(port, host, () => {
-          const addr = server.address();
-          resolve(typeof addr === "object" && addr ? addr.port : port);
-        });
-      });
+    async listen(port, host) {
+      const hosts = Array.isArray(host) ? host : [host];
+      const bound = await listenOne(server, port, hosts[0]);
+      for (const h of hosts.slice(1)) {
+        const extra = createServer(app);
+        extra.on("upgrade", onUpgrade);
+        extraServers.push(extra);
+        await listenOne(extra, bound, h);
+      }
+      return bound;
     },
     async close() {
       registry.close();
       for (const ws of wss.clients) ws.terminate();
       wss.close();
-      const closed = new Promise<void>((r) => server.close(() => r()));
+      const all = [server, ...extraServers];
+      const closed = Promise.all(all.map((srv) => new Promise<void>((r) => (srv.listening ? srv.close(() => r()) : r()))));
       // Give in-flight MCP responses (now resolved as dispatched_unknown) a moment to flush.
       await new Promise((r) => setTimeout(r, 50));
-      server.closeAllConnections();
+      for (const srv of all) srv.closeAllConnections();
       await closed;
     },
   };
