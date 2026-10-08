@@ -54,6 +54,10 @@ describe("hub + agents end to end", () => {
     expect(text(rb)).toContain("from beta");
     // Clients that render only structuredContent must still see the payload.
     expect(rb.structuredContent!.text).toContain("from beta");
+    // Listing and search results are readable as text, not only as structured data.
+    expect(text(await call(c, "list_directory", { machine: "beta", path: h.agents.beta.root }))).toContain("b.txt");
+    const found = await call(c, "search_files", { machine: "beta", path: h.agents.beta.root, content_regex: "from be+ta" });
+    expect(text(found)).toMatch(/b\.txt:1: from beta/);
     // alpha's policy root does not include beta's directory
     const cross = await call(c, "read_file", { machine: "alpha", path: fb });
     expect(cross.isError).toBe(true);

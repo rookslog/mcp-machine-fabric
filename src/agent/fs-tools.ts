@@ -202,7 +202,10 @@ async function listDirectoryTool(policy: Policy, args: Record<string, any>): Pro
   });
   return {
     ok: true,
-    text: `${entries.length} entr${entries.length === 1 ? "y" : "ies"}${truncated ? " (truncated)" : ""}`,
+    text: [
+      `${entries.length} entr${entries.length === 1 ? "y" : "ies"} under ${root}${truncated ? " (truncated)" : ""}`,
+      ...entries.map((e) => `${e.type === "dir" ? "[dir] " : e.type === "symlink" ? "[link]" : e.type === "file" ? "[file]" : "[other]"} ${path.relative(root, e.path) || "."}${e.type === "file" ? `  (${e.size} bytes)` : ""}`),
+    ].join("\n"),
     data: { entries, truncated },
   };
 }
@@ -223,7 +226,11 @@ async function getFileInfoTool(policy: Policy, args: Record<string, any>): Promi
     if (!isBinary(content)) data.lines = textLines(content.toString("utf8")).length;
   }
 
-  return { ok: true, text: `${data.type} ${info.size} bytes`, data };
+  return {
+    ok: true,
+    text: `${checked}: ${data.type}, ${info.size} bytes, mode ${data.mode}, modified ${data.mtime}${data.lines !== undefined ? `, ${data.lines} lines` : ""}`,
+    data,
+  };
 }
 
 async function searchFilesTool(
@@ -251,20 +258,20 @@ async function searchFilesTool(
   if (!options.forceJsSearch) {
     const rgResult = await searchWithRipgrep(root, args, maxResults);
     if (rgResult) {
-      return {
-        ok: true,
-        text: `${rgResult.matches.length} match${rgResult.matches.length === 1 ? "" : "es"}`,
-        data: { ...rgResult, engine: "ripgrep" },
-      };
+      return { ok: true, text: searchText(rgResult), data: { ...rgResult, engine: "ripgrep" } };
     }
   }
 
   const jsResult = await searchWithJs(policy, root, args, maxResults, contentRegex);
-  return {
-    ok: true,
-    text: `${jsResult.matches.length} match${jsResult.matches.length === 1 ? "" : "es"}`,
-    data: { ...jsResult, engine: "js" },
-  };
+  return { ok: true, text: searchText(jsResult), data: { ...jsResult, engine: "js" } };
+}
+
+function searchText(result: { matches: Array<{ path: string; line?: number; text?: string }>; truncated: boolean }): string {
+  const head = `${result.matches.length} match${result.matches.length === 1 ? "" : "es"}${result.truncated ? " (truncated; narrow the search or raise max_results)" : ""}`;
+  const lines = result.matches.map((m) =>
+    m.line !== undefined ? `${m.path}:${m.line}: ${(m.text ?? "").slice(0, 300)}` : m.path,
+  );
+  return [head, ...lines].join("\n");
 }
 
 async function searchWithRipgrep(
