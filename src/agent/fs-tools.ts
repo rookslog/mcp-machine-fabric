@@ -18,20 +18,20 @@
  */
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
+import { constants } from "node:fs";
 import {
-  appendFile,
-  chmod,
   cp,
   lstat,
   mkdir,
+  open,
   readFile,
   readlink,
   readdir,
   rename,
   rm,
   stat,
-  writeFile,
 } from "node:fs/promises";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { ToolErrorCode, ToolOutcome } from "../shared/protocol.js";
 import { checkPath, PolicyError, type Policy } from "./policy.js";
@@ -48,6 +48,14 @@ export type FsToolName =
 
 export interface RunFsToolOptions {
   forceJsSearch?: boolean;
+  /** @internal Deterministic seam for path-policy race regression tests. */
+  testHooks?: FsToolTestHooks;
+}
+
+export interface FsToolTestHooks {
+  afterInitialPathCheck?: (context: { tool: FsToolName; paths: string[] }) => Promise<void> | void;
+  beforeTemporaryFileOpen?: (context: { target: string; temporary: string }) => Promise<void> | void;
+  afterTemporaryFileWrite?: (context: { target: string; temporary: string }) => Promise<void> | void;
 }
 
 const MAX_READ_BYTES = 50 * 1024 * 1024;
@@ -71,6 +79,24 @@ interface DirectoryEntry {
   size: number;
 }
 
+interface VerifiedFile {
+  handle: FileHandle;
+  info: Awaited<ReturnType<FileHandle["stat"]>>;
+  path: string;
+}
+
+interface VerifiedDirectory {
+  handle: FileHandle;
+  path: string;
+  policy: Policy;
+  requested: string;
+}
+
+interface MutationTarget {
+  directory: VerifiedDirectory;
+  path: string;
+}
+
 class ExpectedFailure extends Error {
   constructor(
     readonly code: ToolErrorCode,
@@ -91,7 +117,7 @@ export async function runFsTool(
   try {
     switch (tool) {
       case "read_file":
-        return await readFileTool(policy, args);
+        return await readFileTool(policy, args, options);
       case "list_directory":
         return await listDirectoryTool(policy, args);
       case "get_file_info":
@@ -99,13 +125,13 @@ export async function runFsTool(
       case "search_files":
         return await searchFilesTool(policy, args, options);
       case "write_file":
-        return await writeFileTool(policy, args);
+        return await writeFileTool(policy, args, options);
       case "edit_file":
-        return await editFileTool(policy, args);
+        return await editFileTool(policy, args, options);
       case "create_directory":
-        return await createDirectoryTool(policy, args);
+        return await createDirectoryTool(policy, args, options);
       case "move_path":
-        return await movePathTool(policy, args);
+        return await movePathTool(policy, args, options);
       default:
         throw new ExpectedFailure("invalid_arguments", `unknown filesystem tool: ${String(tool)}`);
     }
@@ -116,14 +142,20 @@ export async function runFsTool(
 
 const MAX_RESPONSE_BYTES = 256 * 1024;
 
-async function readFileTool(policy: Policy, args: Record<string, any>): Promise<ToolOutcome> {
+async function readFileTool(policy: Policy, args: Record<string, any>, options: RunFsToolOptions): Promise<ToolOutcome> {
   const checked = await checkedPath(policy, args.path, "read");
-  const info = await stat(checked);
-  if (info.size > MAX_READ_BYTES) {
-    throw new ExpectedFailure("too_large", `file is larger than ${MAX_READ_BYTES} bytes`);
+  await options.testHooks?.afterInitialPathCheck?.({ tool: "read_file", paths: [checked] });
+  const opened = await openVerifiedFile(policy, args.path, "read");
+  const { info } = opened;
+  let content: Buffer;
+  try {
+    if (info.size > MAX_READ_BYTES) {
+      throw new ExpectedFailure("too_large", `file is larger than ${MAX_READ_BYTES} bytes`);
+    }
+    content = await opened.handle.readFile();
+  } finally {
+    await opened.handle.close();
   }
-
-  const content = await readFile(checked);
   if (isBinary(content)) throw new ExpectedFailure("invalid_arguments", "binary file cannot be read as text");
 
   const lines = textLines(content.toString("utf8"));
@@ -156,7 +188,7 @@ async function readFileTool(policy: Policy, args: Record<string, any>): Promise<
     ok: true,
     text: selected.length > 0 ? `${header}\n${selected.join("\n")}` : header,
     data: {
-      path: checked,
+      path: opened.path,
       total_lines: lines.length,
       offset,
       lines_returned: selected.length,
@@ -456,115 +488,271 @@ async function searchWithJs(
   };
 }
 
-async function writeFileTool(policy: Policy, args: Record<string, any>): Promise<ToolOutcome> {
+async function writeFileTool(policy: Policy, args: Record<string, any>, options: RunFsToolOptions): Promise<ToolOutcome> {
   const checked = await checkedPath(policy, args.path, "write");
   const parent = await checkedPath(policy, path.dirname(args.path), "write");
+  await options.testHooks?.afterInitialPathCheck?.({ tool: "write_file", paths: [checked, parent] });
 
   return await withMutationLock(async () => {
-    if (args.expected_sha256 !== undefined) {
-      let current: Buffer;
-      try {
-        current = await readFile(checked);
-      } catch (error) {
-        if (errorCode(error) === "ENOENT") {
-          throw new ExpectedFailure("conflict", "file is missing; expected_sha256 cannot match");
+    let target: MutationTarget | undefined;
+    try {
+      if (args.expected_sha256 !== undefined) {
+        let current: Buffer;
+        try {
+          target = await checkedMutationTarget(policy, args.path, false);
+          current = await readMutationFile(target);
+        } catch (error) {
+          if (errorCode(error) === "ENOENT") {
+            throw new ExpectedFailure("conflict", "file is missing; expected_sha256 cannot match");
+          }
+          throw error;
         }
-        throw error;
+        if (sha256(current) !== args.expected_sha256) {
+          throw new ExpectedFailure("conflict", "file changed since expected_sha256 was calculated");
+        }
       }
-      if (sha256(current) !== args.expected_sha256) {
-        throw new ExpectedFailure("conflict", "file changed since expected_sha256 was calculated");
+      target ??= await checkedMutationTarget(policy, args.path, true);
+
+      const content = Buffer.from(args.content, "utf8");
+      if ((args.mode ?? "rewrite") === "append") await appendVerified(target, content, options.testHooks);
+      else await atomicRewrite(target, content, options.testHooks);
+
+      const finalContent = await readMutationFile(target);
+      return {
+        ok: true,
+        text: `wrote ${content.byteLength} bytes to ${target.path}`,
+        data: { path: target.path, bytes_written: content.byteLength, sha256: sha256(finalContent) },
+      };
+    } finally {
+      await target?.directory.handle.close();
+    }
+  });
+}
+
+async function editFileTool(policy: Policy, args: Record<string, any>, options: RunFsToolOptions): Promise<ToolOutcome> {
+  const checked = await checkedPath(policy, args.path, "write");
+  await options.testHooks?.afterInitialPathCheck?.({ tool: "edit_file", paths: [checked] });
+  return await withMutationLock(async () => {
+    const target = await checkedMutationTarget(policy, args.path, false);
+    try {
+      const content = (await readMutationFile(target)).toString("utf8");
+      const expected = args.expected_replacements ?? 1;
+      const found = countOccurrences(content, args.old_text);
+      if (found !== expected) {
+        throw new ExpectedFailure("conflict", `expected ${expected} replacements but found ${found}`, { found });
       }
+
+      const updated = content.split(args.old_text).join(args.new_text);
+      await atomicRewrite(target, Buffer.from(updated, "utf8"), options.testHooks);
+      const oldContext = shortContext(args.old_text);
+      const newContext = shortContext(args.new_text);
+      return {
+        ok: true,
+        text: `@@ ${found} replacement${found === 1 ? "" : "s"} @@\n-${oldContext}\n+${newContext}`,
+        data: { path: target.path, replacements: found, sha256: sha256(Buffer.from(updated, "utf8")) },
+      };
+    } finally {
+      await target.directory.handle.close();
     }
-
-    await mkdir(parent, { recursive: true });
-    const content = Buffer.from(args.content, "utf8");
-    if ((args.mode ?? "rewrite") === "append") await appendFile(checked, content);
-    else await atomicRewrite(checked, content);
-
-    const finalContent = await readFile(checked);
-    return {
-      ok: true,
-      text: `wrote ${content.byteLength} bytes to ${checked}`,
-      data: { path: checked, bytes_written: content.byteLength, sha256: sha256(finalContent) },
-    };
   });
 }
 
-async function editFileTool(policy: Policy, args: Record<string, any>): Promise<ToolOutcome> {
+async function createDirectoryTool(policy: Policy, args: Record<string, any>, options: RunFsToolOptions): Promise<ToolOutcome> {
   const checked = await checkedPath(policy, args.path, "write");
+  await options.testHooks?.afterInitialPathCheck?.({ tool: "create_directory", paths: [checked] });
   return await withMutationLock(async () => {
-    const content = await readFile(checked, "utf8");
-    const expected = args.expected_replacements ?? 1;
-    const found = countOccurrences(content, args.old_text);
-    if (found !== expected) {
-      throw new ExpectedFailure("conflict", `expected ${expected} replacements but found ${found}`, { found });
-    }
-
-    const updated = content.split(args.old_text).join(args.new_text);
-    await atomicRewrite(checked, Buffer.from(updated, "utf8"));
-    const oldContext = shortContext(args.old_text);
-    const newContext = shortContext(args.new_text);
-    return {
-      ok: true,
-      text: `@@ ${found} replacement${found === 1 ? "" : "s"} @@\n-${oldContext}\n+${newContext}`,
-      data: { path: checked, replacements: found, sha256: sha256(Buffer.from(updated, "utf8")) },
-    };
+    const rechecked = await checkedPath(policy, args.path, "write");
+    await mkdir(rechecked, { recursive: true });
+    const finalPath = await checkedPath(policy, args.path, "write");
+    return { ok: true, text: `directory ready: ${finalPath}`, data: { path: finalPath } };
   });
 }
 
-async function createDirectoryTool(policy: Policy, args: Record<string, any>): Promise<ToolOutcome> {
-  const checked = await checkedPath(policy, args.path, "write");
-  return await withMutationLock(async () => {
-    await mkdir(checked, { recursive: true });
-    return { ok: true, text: `directory ready: ${checked}`, data: { path: checked } };
-  });
-}
-
-async function movePathTool(policy: Policy, args: Record<string, any>): Promise<ToolOutcome> {
+async function movePathTool(policy: Policy, args: Record<string, any>, options: RunFsToolOptions): Promise<ToolOutcome> {
   const source = await checkedPath(policy, args.source, "write");
   const destination = await checkedPath(policy, args.destination, "write");
+  await options.testHooks?.afterInitialPathCheck?.({ tool: "move_path", paths: [source, destination] });
 
   return await withMutationLock(async () => {
+    const checkedSource = await checkedPath(policy, args.source, "write");
+    const checkedDestination = await checkedPath(policy, args.destination, "write");
     try {
-      await lstat(destination);
-      throw new ExpectedFailure("conflict", `destination already exists: ${destination}`);
+      await lstat(checkedDestination);
+      throw new ExpectedFailure("conflict", `destination already exists: ${checkedDestination}`);
     } catch (error) {
       if (error instanceof ExpectedFailure) throw error;
       if (errorCode(error) !== "ENOENT") throw error;
     }
 
     try {
-      await rename(source, destination);
+      await rename(checkedSource, checkedDestination);
     } catch (error) {
       if (errorCode(error) !== "EXDEV") throw error;
-      await cp(source, destination, {
+      await cp(checkedSource, checkedDestination, {
         recursive: true,
         errorOnExist: true,
         force: false,
         preserveTimestamps: true,
         verbatimSymlinks: true,
       });
-      await rm(source, { recursive: true, force: false });
+      await rm(checkedSource, { recursive: true, force: false });
     }
 
-    return { ok: true, text: `moved ${source} to ${destination}`, data: { source, destination } };
+    return {
+      ok: true,
+      text: `moved ${checkedSource} to ${checkedDestination}`,
+      data: { source: checkedSource, destination: checkedDestination },
+    };
   });
 }
 
-async function atomicRewrite(file: string, content: Buffer): Promise<void> {
+function sameFile(left: { dev: number | bigint; ino: number | bigint }, right: { dev: number | bigint; ino: number | bigint }): boolean {
+  return left.dev === right.dev && left.ino === right.ino;
+}
+
+function changedPath(requested: string): PolicyError {
+  return new PolicyError(`path changed while enforcing policy: ${requested}`);
+}
+
+async function openVerifiedFile(policy: Policy, requested: string, effect: "read" | "write"): Promise<VerifiedFile> {
+  const checked = await checkedPath(policy, requested, effect);
+  let handle: FileHandle;
+  try {
+    handle = await open(checked, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (errorCode(error) === "ELOOP") throw changedPath(requested);
+    throw error;
+  }
+  try {
+    const info = await handle.stat();
+    const rechecked = await checkedPath(policy, requested, effect);
+    const current = await stat(rechecked);
+    if (!sameFile(info, current)) throw changedPath(requested);
+    return { handle, info, path: rechecked };
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+async function openVerifiedDirectory(policy: Policy, requested: string): Promise<VerifiedDirectory> {
+  const checked = await checkedPath(policy, requested, "write");
+  let handle: FileHandle;
+  try {
+    handle = await open(checked, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (errorCode(error) === "ELOOP") throw changedPath(requested);
+    throw error;
+  }
+  const directory = { handle, path: checked, policy, requested };
+  try {
+    await verifyDirectory(directory);
+    return directory;
+  } catch (error) {
+    await handle.close();
+    throw error;
+  }
+}
+
+async function verifyDirectory(directory: VerifiedDirectory): Promise<void> {
+  const rechecked = await checkedPath(directory.policy, directory.requested, "write");
+  const [opened, current] = await Promise.all([directory.handle.stat(), stat(rechecked)]);
+  if (!sameFile(opened, current)) throw changedPath(directory.requested);
+  directory.path = rechecked;
+}
+
+async function checkedMutationTarget(policy: Policy, requested: string, createParent: boolean): Promise<MutationTarget> {
+  const requestedParent = path.dirname(requested);
+  if (createParent) {
+    const checkedParent = await checkedPath(policy, requestedParent, "write");
+    await mkdir(checkedParent, { recursive: true });
+  }
+
+  const checked = await checkedPath(policy, requested, "write");
+  const directory = await openVerifiedDirectory(policy, requestedParent);
+  const target = path.join(directory.path, path.basename(requested));
+  if (checked !== target) {
+    await directory.handle.close();
+    throw new PolicyError(`final symlink is not allowed for mutation: ${requested}`);
+  }
+  return { directory, path: target };
+}
+
+async function readMutationFile(target: MutationTarget): Promise<Buffer> {
+  await verifyDirectory(target.directory);
+  let handle: FileHandle;
+  try {
+    handle = await open(target.path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (errorCode(error) === "ELOOP") throw changedPath(target.path);
+    throw error;
+  }
+  try {
+    await verifyDirectory(target.directory);
+    const [opened, current] = await Promise.all([handle.stat(), stat(target.path)]);
+    if (!sameFile(opened, current)) throw changedPath(target.path);
+    return await handle.readFile();
+  } finally {
+    await handle.close();
+  }
+}
+
+async function appendVerified(target: MutationTarget, content: Buffer, testHooks?: FsToolTestHooks): Promise<void> {
+  await verifyDirectory(target.directory);
+  let handle: FileHandle;
+  try {
+    handle = await open(target.path, constants.O_WRONLY | constants.O_APPEND | constants.O_NOFOLLOW);
+  } catch (error) {
+    if (errorCode(error) === "ENOENT") {
+      await atomicRewrite(target, content, testHooks);
+      return;
+    }
+    if (errorCode(error) === "ELOOP") throw changedPath(target.path);
+    throw error;
+  }
+  try {
+    await verifyDirectory(target.directory);
+    const [opened, current] = await Promise.all([handle.stat(), stat(target.path)]);
+    if (!sameFile(opened, current)) throw changedPath(target.path);
+    await handle.writeFile(content);
+  } finally {
+    await handle.close();
+  }
+}
+
+async function atomicRewrite(target: MutationTarget, content: Buffer, testHooks?: FsToolTestHooks): Promise<void> {
   let existingMode: number | undefined;
   try {
-    existingMode = (await stat(file)).mode & 0o7777;
+    const existing = await lstat(target.path);
+    if (existing.isSymbolicLink()) throw changedPath(target.path);
+    existingMode = existing.mode & 0o7777;
   } catch (error) {
     if (errorCode(error) !== "ENOENT") throw error;
   }
 
-  const temporary = path.join(path.dirname(file), `.${path.basename(file)}.${process.pid}.${randomUUID()}.tmp`);
+  await verifyDirectory(target.directory);
+  const temporary = path.join(target.directory.path, `.${path.basename(target.path)}.${process.pid}.${randomUUID()}.tmp`);
+  let temporaryHandle: FileHandle | undefined;
   try {
-    await writeFile(temporary, content, { flag: "wx", mode: existingMode ?? 0o666 });
-    if (existingMode !== undefined) await chmod(temporary, existingMode);
-    await rename(temporary, file);
+    await testHooks?.beforeTemporaryFileOpen?.({ target: target.path, temporary });
+    temporaryHandle = await open(
+      temporary,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      existingMode ?? 0o666,
+    );
+    await verifyDirectory(target.directory);
+    const [openedTemporary, currentTemporary] = await Promise.all([temporaryHandle.stat(), lstat(temporary)]);
+    if (currentTemporary.isSymbolicLink() || !sameFile(openedTemporary, currentTemporary)) throw changedPath(temporary);
+    await temporaryHandle.writeFile(content);
+    await testHooks?.afterTemporaryFileWrite?.({ target: target.path, temporary });
+    if (existingMode !== undefined) await temporaryHandle.chmod(existingMode);
+    await temporaryHandle.close();
+    temporaryHandle = undefined;
+    await verifyDirectory(target.directory);
+    await rename(temporary, target.path);
+    await verifyDirectory(target.directory);
   } catch (error) {
+    await temporaryHandle?.close().catch(() => undefined);
     await rm(temporary, { force: true }).catch(() => undefined);
     throw error;
   }

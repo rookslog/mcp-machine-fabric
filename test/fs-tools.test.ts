@@ -7,7 +7,9 @@ import {
   mkdir,
   readFile,
   readlink,
+  readdir,
   realpath,
+  rename,
   rm,
   stat,
   symlink,
@@ -442,6 +444,105 @@ describe("runFsTool", () => {
     failure(await runFsTool(policy, "read_file", { path: readLink }), "policy_denied");
     failure(await runFsTool(policy, "write_file", { path: writeLink, content: "overwrite" }), "policy_denied");
     expect(await readFile(outsideFile, "utf8")).toBe("secret");
+  });
+
+  test("write_file refuses an intermediate-directory symlink swap between policy check and mutation", async () => {
+    const directory = path.join(root, "write-parent");
+    const parked = path.join(root, "write-parent-parked");
+    const requested = path.join(directory, "escaped.txt");
+    const escaped = path.join(outside, "escaped.txt");
+    await mkdir(directory);
+
+    const outcome = await runFsTool(
+      policy,
+      "write_file",
+      { path: requested, content: "must stay inside" },
+      {
+        testHooks: {
+          afterInitialPathCheck: async () => {
+            await rename(directory, parked);
+            await symlink(outside, directory);
+          },
+        },
+      },
+    );
+
+    failure(outcome, "policy_denied");
+    await expect(lstat(escaped)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("write_file does not expose content when the parent changes at temporary-file creation", async () => {
+    const directory = path.join(root, "write-boundary");
+    const parked = path.join(root, "write-boundary-parked");
+    const requested = path.join(directory, "escaped.txt");
+    await mkdir(directory);
+
+    let releaseWrite!: () => void;
+    const writeReleased = new Promise<void>((resolve) => {
+      releaseWrite = resolve;
+    });
+    let reportWrite!: () => void;
+    const writeReported = new Promise<void>((resolve) => {
+      reportWrite = resolve;
+    });
+    const operation = runFsTool(
+      policy,
+      "write_file",
+      { path: requested, content: "must stay inside" },
+      {
+        testHooks: {
+          beforeTemporaryFileOpen: async () => {
+            await rename(directory, parked);
+            await symlink(outside, directory);
+          },
+          afterTemporaryFileWrite: async () => {
+            reportWrite();
+            await writeReleased;
+          },
+        },
+      },
+    );
+
+    const event = await Promise.race([
+      writeReported.then(() => "write" as const),
+      operation.then(() => "done" as const),
+    ]);
+    try {
+      if (event === "write") {
+        const outsideFiles = await readdir(outside);
+        const contents = await Promise.all(outsideFiles.map((entry) => readFile(path.join(outside, entry), "utf8")));
+        expect(contents).not.toContain("must stay inside");
+      }
+    } finally {
+      releaseWrite();
+    }
+
+    failure(await operation, "policy_denied");
+    expect(await readdir(outside)).toEqual([]);
+  });
+
+  test("read_file refuses an intermediate-directory symlink swap before opening the file", async () => {
+    const directory = path.join(root, "read-parent");
+    const parked = path.join(root, "read-parent-parked");
+    const requested = path.join(directory, "value.txt");
+    await mkdir(directory);
+    await Promise.all([writeFile(requested, "inside"), writeFile(path.join(outside, "value.txt"), "outside secret")]);
+
+    const outcome = await runFsTool(
+      policy,
+      "read_file",
+      { path: requested },
+      {
+        testHooks: {
+          afterInitialPathCheck: async () => {
+            await rename(directory, parked);
+            await symlink(outside, directory);
+          },
+        },
+      },
+    );
+
+    expect(failure(outcome, "policy_denied").message).not.toContain("outside secret");
   });
 
   test("a broken symlink targeting an outside path is denied before append can create its target", async () => {
