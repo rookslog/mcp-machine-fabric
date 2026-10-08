@@ -52,6 +52,8 @@ describe("hub + agents end to end", () => {
     expect(await readFile(fa, "utf8")).toBe("from alpha\n");
     const rb = await call(c, "read_file", { machine: "beta", path: fb });
     expect(text(rb)).toContain("from beta");
+    // Clients that render only structuredContent must still see the payload.
+    expect(rb.structuredContent!.text).toContain("from beta");
     // alpha's policy root does not include beta's directory
     const cross = await call(c, "read_file", { machine: "alpha", path: fb });
     expect(cross.isError).toBe(true);

@@ -47,22 +47,30 @@ function rowView(r: RequestRow) {
   };
 }
 
+/**
+ * Results carry the human-readable text in BOTH the text content block and
+ * `structuredContent.text`: some clients (observed: Claude Code 2026-10) show
+ * only structuredContent when it is present, which would hide file contents
+ * and command output.
+ */
 function outcomeResult(outcome: ToolOutcome, meta: Record<string, unknown>, note?: string): CallToolResult {
   if (outcome.ok) {
+    const text = note ? `${note}\n${outcome.text}` : outcome.text;
     return {
-      content: [{ type: "text", text: note ? `${note}\n${outcome.text}` : outcome.text }],
-      structuredContent: { ...meta, ...(outcome.data ?? {}) },
+      content: [{ type: "text", text }],
+      structuredContent: { ...meta, ...(outcome.data ?? {}), text },
     };
   }
+  const text = `${note ? note + "\n" : ""}Error (${outcome.code}): ${outcome.message}`;
   return {
     isError: true,
-    content: [{ type: "text", text: `${note ? note + "\n" : ""}Error (${outcome.code}): ${outcome.message}` }],
-    structuredContent: { ...meta, error_code: outcome.code, ...(outcome.data ?? {}) },
+    content: [{ type: "text", text }],
+    structuredContent: { ...meta, error_code: outcome.code, ...(outcome.data ?? {}), text },
   };
 }
 
 function hubError(text: string, meta: Record<string, unknown>): CallToolResult {
-  return { isError: true, content: [{ type: "text", text }], structuredContent: meta };
+  return { isError: true, content: [{ type: "text", text }], structuredContent: { ...meta, text } };
 }
 
 const MACHINE_HELP =
@@ -104,10 +112,8 @@ export function createMcpServer(ctx: McpContext, caller: CallerInfo): McpServer 
         const where = h.agent ? ` ${h.agent.platform}/${h.agent.arch} host=${h.agent.hostname}` : "";
         return `${h.machine}: ${h.ready ? "READY" : `NOT READY (${h.reason})`}${where}${h.heartbeat_rtt_ms !== null ? ` rtt=${h.heartbeat_rtt_ms}ms` : ""}${pol}`;
       });
-      return {
-        content: [{ type: "text", text: lines.length ? lines.join("\n") : "No machines enrolled. Enroll one with `mmf device add <name>` on the hub." }],
-        structuredContent: { machines: health as unknown as Record<string, unknown>[] },
-      };
+      const text = lines.length ? lines.join("\n") : "No machines enrolled. Enroll one with `mmf device add <name>` on the hub.";
+      return { content: [{ type: "text", text }], structuredContent: { machines: health as unknown as Record<string, unknown>[], text } };
     },
   );
 
@@ -128,7 +134,7 @@ export function createMcpServer(ctx: McpContext, caller: CallerInfo): McpServer 
       const text =
         `${row.request_id} ${row.tool} on ${row.machine}: ${row.state}` +
         (outcome ? `\n${outcome.ok ? outcome.text : `Error (${outcome.code}): ${outcome.message}`}` : "");
-      return { content: [{ type: "text", text }], structuredContent: { ...view, outcome } };
+      return { content: [{ type: "text", text }], structuredContent: { ...view, outcome, text } };
     },
   );
 
@@ -148,7 +154,8 @@ export function createMcpServer(ctx: McpContext, caller: CallerInfo): McpServer 
       const text = rows
         .map((r) => `${r.created_at} ${r.request_id} ${r.machine} ${r.tool} ${r.state}${r.error_code ? ` (${r.error_code})` : ""}`)
         .join("\n");
-      return { content: [{ type: "text", text: text || "No requests recorded." }], structuredContent: { requests: rows } };
+      const body = text || "No requests recorded.";
+      return { content: [{ type: "text", text: body }], structuredContent: { requests: rows, text: body } };
     },
   );
 
