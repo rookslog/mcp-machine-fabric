@@ -112,9 +112,11 @@ test(
         MMF_PACK_SMOKE_WAIT_SECONDS: "0.1",
       });
       expect(output).not.toContain("PACK_SMOKE_OK");
-      sleepPid = Number((await readFile(pidFile, "utf8")).trim());
-      expect(sleepPid).toBeGreaterThan(0);
-      expect(() => process.kill(sleepPid, 0)).toThrow();
+      // If the cancel landed before the shell reached `sleep &`, no pid file
+      // exists and nothing can have leaked; otherwise the sleeper must be dead.
+      const pidText = await readFile(pidFile, "utf8").catch(() => "");
+      sleepPid = Number(pidText.trim());
+      if (sleepPid > 0) expect(() => process.kill(sleepPid, 0)).toThrow();
     } finally {
       if (sleepPid > 0) {
         try {
