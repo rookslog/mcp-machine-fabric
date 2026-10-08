@@ -58,7 +58,12 @@ if grep -Eq '^package/(src|test)/|\.js\.map$' <<<"$contents"; then
 fi
 
 install_dir="$work_dir/install"
-npm install --prefix "$install_dir" --omit=dev --no-audit --no-fund --offline "$tarball"
+# Offline by default so a local run never touches the registry. CI runners
+# start with an npm cache that lacks registry metadata, so CI opts in to
+# network with MMF_PACK_SMOKE_NETWORK=1 (still preferring the cache).
+net_mode="--offline"
+if [[ "${MMF_PACK_SMOKE_NETWORK:-}" == "1" ]]; then net_mode="--prefer-offline"; fi
+npm install --prefix "$install_dir" --omit=dev --no-audit --no-fund "$net_mode" "$tarball"
 mmf="$install_dir/node_modules/.bin/mmf"
 package_dir="$install_dir/node_modules/mcp-machine-fabric"
 version=$(node -p "require('./package.json').version")

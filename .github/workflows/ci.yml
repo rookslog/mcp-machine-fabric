@@ -23,6 +23,8 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm test
+        env:
+          MMF_PACK_SMOKE_NETWORK: "1"
       - name: CLI smoke
         run: node dist/cli.js version
   secrets:

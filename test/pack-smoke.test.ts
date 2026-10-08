@@ -39,7 +39,7 @@ test(
   async () => {
     const emptyCache = await mkdtemp(nodePath.join(tmpdir(), "mmf-empty-npm-cache-"));
     try {
-      const output = await expectSmokeFailure({ ...process.env, npm_config_cache: emptyCache });
+      const output = await expectSmokeFailure({ ...process.env, npm_config_cache: emptyCache, MMF_PACK_SMOKE_NETWORK: "" });
       expect(output).toMatch(/ENOTCACHED|cache miss|offline mode/i);
       expect(output).not.toContain("PACK_SMOKE_OK");
     } finally {
