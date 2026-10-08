@@ -6,7 +6,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
-import { createMcpServer } from "./mcp.js";
+import { allowedMachineNames, createMcpServer, requestRowView, visibleRequestRows } from "./mcp.js";
 import { Registry } from "./registry.js";
 import type { HubStore } from "./store.js";
 import { renderDashboard } from "./dashboard.js";
@@ -75,19 +75,26 @@ export function createHub(opts: HubOptions): Hub {
 
   if (opts.authRouter) app.use(opts.authRouter);
 
-  const bearer = requireBearerAuth({ verifier: opts.verifier, resourceMetadataUrl });
+  const bearer = requireBearerAuth({ verifier: opts.verifier, requiredScopes: ["fabric:read"], resourceMetadataUrl });
 
   const callerOf = (req: Request) => {
     const auth = (req as Request & { auth?: AuthInfo }).auth!;
     return { principal: auth.clientId, scopes: auth.scopes };
   };
 
-  app.get("/api/status", bearer, (_req, res) => {
-    res.json({ version: opts.hubVersion, machines: registry.allHealth() });
+  app.get("/api/status", bearer, (req, res) => {
+    const caller = callerOf(req);
+    const enrolled = store.listDevices().filter((device) => !device.revoked_at).map((device) => device.name);
+    const allowed = new Set(allowedMachineNames(enrolled, caller.scopes));
+    res.json({ version: opts.hubVersion, machines: registry.allHealth().filter((machine) => allowed.has(machine.machine)) });
   });
   app.get("/api/requests", bearer, (req, res) => {
+    const caller = callerOf(req);
     const limit = Math.min(Number(req.query.limit ?? 50) || 50, 500);
-    res.json({ requests: store.recentRequests(limit, typeof req.query.machine === "string" ? req.query.machine : undefined) });
+    const enrolled = store.listDevices().filter((device) => !device.revoked_at).map((device) => device.name);
+    const allowed = allowedMachineNames(enrolled, caller.scopes);
+    const rows = visibleRequestRows(store, caller, allowed, limit, typeof req.query.machine === "string" ? req.query.machine : undefined);
+    res.json({ requests: rows.map(requestRowView) });
   });
   app.get("/", (_req, res) => {
     res.setHeader("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src 'self'");

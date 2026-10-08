@@ -496,10 +496,9 @@ describe("authorization consent", () => {
 
     const response = await fetch(url, { redirect: "manual" });
 
-    expect(response.status).toBe(302);
-    expect(new URL(response.headers.get("location")!).searchParams.get("error")).toBe(
-      "invalid_target",
-    );
+    expect(response.status).toBe(400);
+    expect(response.headers.get("location")).toBeNull();
+    expect(await response.text()).toContain("Invalid authorization request");
   });
 });
 

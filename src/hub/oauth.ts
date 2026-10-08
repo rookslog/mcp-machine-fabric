@@ -9,6 +9,7 @@ import express, { type Response, type Router } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import {
   InvalidGrantError,
+  InvalidRequestError,
   InvalidScopeError,
   InvalidTargetError,
   InvalidTokenError,
@@ -37,6 +38,7 @@ interface ProviderOptions {
   db: DatabaseSync;
   mcpResourceUrl: string | URL;
   now?: () => number;
+  listMachines?: () => string[];
 }
 
 export interface PersonalTokenSummary {
@@ -117,9 +119,29 @@ function randomId(bytes = 32): string {
   return randomBytes(bytes).toString("base64url");
 }
 
-function normalizeScopes(scopes: readonly string[]): FabricScope[] {
+const MACHINE_SCOPE_PREFIX = "machine:";
+const MACHINE_NAME_RE = /^[a-z][a-z0-9-]{0,31}$/;
+
+function normalizeFabricScopes(scopes: readonly string[]): FabricScope[] {
   const requested = new Set(scopes);
   return SCOPES.filter((scope) => requested.has(scope));
+}
+
+function normalizeScopes(scopes: readonly string[]): string[] {
+  const fabric = normalizeFabricScopes(scopes);
+  const machines = scopes
+    .filter((scope) => scope.startsWith(MACHINE_SCOPE_PREFIX))
+    .map((scope) => scope.slice(MACHINE_SCOPE_PREFIX.length))
+    .filter((machine, index, all) => MACHINE_NAME_RE.test(machine) && all.indexOf(machine) === index)
+    .map((machine) => `${MACHINE_SCOPE_PREFIX}${machine}`);
+  return [...fabric, ...machines];
+}
+
+function requestedScopes(scopes: readonly string[], machines: readonly string[]): string[] {
+  const enrolled = new Set(machines);
+  return normalizeScopes(scopes).filter(
+    (scope) => !scope.startsWith(MACHINE_SCOPE_PREFIX) || enrolled.has(scope.slice(MACHINE_SCOPE_PREFIX.length)),
+  );
 }
 
 function escapeHtml(value: string): string {
@@ -142,16 +164,37 @@ function redirectWithParams(
   return url.href;
 }
 
+function redirectUriMatches(requested: string, registered: string): boolean {
+  if (requested === registered) return true;
+  try {
+    const candidate = new URL(requested);
+    const expected = new URL(registered);
+    const loopback = new Set(["localhost", "127.0.0.1", "[::1]", "::1"]);
+    return (
+      loopback.has(candidate.hostname) &&
+      loopback.has(expected.hostname) &&
+      candidate.protocol === expected.protocol &&
+      candidate.hostname === expected.hostname &&
+      candidate.pathname === expected.pathname &&
+      candidate.search === expected.search
+    );
+  } catch {
+    return false;
+  }
+}
+
 export class FabricOAuthProvider implements OAuthServerProvider {
   readonly #db: DatabaseSync;
   readonly #mcpResourceUrl: URL;
   readonly #now: () => number;
+  readonly #listMachines: () => string[];
   readonly #clientsStore: OAuthRegisteredClientsStore;
 
-  constructor({ db, mcpResourceUrl, now = Date.now }: ProviderOptions) {
+  constructor({ db, mcpResourceUrl, now = Date.now, listMachines = () => [] }: ProviderOptions) {
     this.#db = db;
     this.#mcpResourceUrl = new URL(String(mcpResourceUrl));
     this.#now = now;
+    this.#listMachines = listMachines;
     this.#createTables();
     this.#clientsStore = {
       getClient: (clientId) => this.#getClient(clientId),
@@ -163,20 +206,27 @@ export class FabricOAuthProvider implements OAuthServerProvider {
     return this.#clientsStore;
   }
 
+  listMachines(): string[] {
+    return this.#listMachines();
+  }
+
   async authorize(
     client: OAuthClientInformationFull,
     params: AuthorizationParams,
     res: Response,
   ): Promise<void> {
+    this.pruneOAuthStorage(client.client_id);
     if (params.resource !== undefined && params.resource.href !== this.#mcpResourceUrl.href) {
       throw new InvalidTargetError("Requested resource is not served by this authorization server");
     }
     const id = randomId();
     const now = this.#nowSeconds();
-    const requestedScopes =
-      params.scopes === undefined || params.scopes.length === 0
-        ? [...SCOPES]
-        : normalizeScopes(params.scopes);
+    const suppliedScopes = (params.scopes ?? []).filter(Boolean);
+    const omittedScopes = suppliedScopes.length === 0;
+    const normalizedRequested = requestedScopes(
+      omittedScopes ? SCOPES : suppliedScopes,
+      this.#listMachines(),
+    );
     const resource = params.resource?.href ?? this.#mcpResourceUrl.href;
     this.#db
       .prepare(
@@ -191,14 +241,18 @@ export class FabricOAuthProvider implements OAuthServerProvider {
         params.redirectUri,
         params.codeChallenge,
         params.state ?? null,
-        JSON.stringify(requestedScopes),
+        JSON.stringify(normalizedRequested),
         resource,
         now,
         now + 10 * 60,
       );
     const pending = this.#getPending(id);
     if (!pending) throw new InvalidGrantError("Unable to create authorization request");
-    this.renderConsentPage(pending, res);
+    const preselectedFabric = omittedScopes ? ["fabric:read"] : normalizeFabricScopes(normalizedRequested);
+    const preselectedMachines = normalizedRequested
+      .filter((scope) => scope.startsWith(MACHINE_SCOPE_PREFIX))
+      .map((scope) => scope.slice(MACHINE_SCOPE_PREFIX.length));
+    this.renderConsentPage(pending, res, undefined, preselectedFabric, preselectedMachines, preselectedMachines.length > 0 ? "only" : "all");
   }
 
   async challengeForAuthorizationCode(
@@ -247,6 +301,7 @@ export class FabricOAuthProvider implements OAuthServerProvider {
     return this.#transaction(() => {
       const familyId = randomId(16);
       const scopes = JSON.parse(row.scopes_json) as string[];
+      this.#db.prepare("UPDATE oauth_clients SET token_issued_at = ? WHERE client_id = ?").run(this.#nowSeconds(), client.client_id);
       this.#db
         .prepare(
           `INSERT INTO oauth_token_families
@@ -302,10 +357,17 @@ export class FabricOAuthProvider implements OAuthServerProvider {
     }
     const familyScopes = JSON.parse(row.family_scopes_json) as string[];
     const grantedScopes = scopes === undefined ? familyScopes : normalizeScopes(scopes);
+    const familyMachineScopes = familyScopes.filter((scope) =>
+      scope.startsWith(MACHINE_SCOPE_PREFIX),
+    );
+    const grantedMachineScopes = grantedScopes.filter((scope) =>
+      scope.startsWith(MACHINE_SCOPE_PREFIX),
+    );
     if (
       scopes !== undefined &&
       (grantedScopes.length !== scopes.length ||
-        grantedScopes.some((scope) => !familyScopes.includes(scope)))
+        grantedScopes.some((scope) => !familyScopes.includes(scope)) ||
+        (familyMachineScopes.length > 0 && grantedMachineScopes.length === 0))
     ) {
       throw new InvalidScopeError("Requested scope exceeds the original grant");
     }
@@ -377,21 +439,40 @@ export class FabricOAuthProvider implements OAuthServerProvider {
     res: Response,
     error?: string,
     selectedScopes?: readonly string[],
+    selectedMachines?: readonly string[],
+    machineMode: "all" | "only" = "all",
   ): void {
     const client = pending.info_json
       ? (JSON.parse(pending.info_json) as OAuthClientInformationFull)
       : undefined;
     const name = escapeHtml(client?.client_name ?? client?.client_id ?? pending.client_id);
-    const redirectHost = escapeHtml(new URL(pending.redirect_uri).host);
-    const redirectOrigin = new URL(pending.redirect_uri).origin;
-    const scopes = JSON.parse(pending.scopes_json) as string[];
-    const selected = new Set(selectedScopes === undefined ? scopes : normalizeScopes(selectedScopes));
-    const scopeControls = scopes
+    const redirect = new URL(pending.redirect_uri);
+    const redirectOrigin = redirect.origin;
+    const requested = new Set(JSON.parse(pending.scopes_json) as string[]);
+    const selected = new Set(
+      (selectedScopes === undefined ? normalizeFabricScopes([...requested]) : normalizeFabricScopes(selectedScopes)).filter((scope) => requested.has(scope)),
+    );
+    const scopeControls = SCOPES
       .map(
         (scope) =>
-          `<label><input type="checkbox" name="scope" value="${escapeHtml(scope)}"${selected.has(scope as FabricScope) ? " checked" : ""}> ${escapeHtml(scope)}</label>`,
+          `<label><input type="checkbox" name="scope" value="${escapeHtml(scope)}"${selected.has(scope) ? " checked" : ""}> ${escapeHtml(scope)}</label>`,
       )
       .join("\n");
+    const machines = this.#listMachines();
+    const requestedMachines = [...requested]
+      .filter((scope) => scope.startsWith(MACHINE_SCOPE_PREFIX))
+      .map((scope) => scope.slice(MACHINE_SCOPE_PREFIX.length));
+    const selectedMachineSet = new Set(selectedMachines ?? requestedMachines);
+    const machineControls = machines.length
+      ? machines
+          .map(
+            (machine) =>
+              `<label><input type="checkbox" name="machine" value="${escapeHtml(machine)}"${selectedMachineSet.has(machine) ? " checked" : ""}> ${escapeHtml(machine)}</label>`,
+          )
+          .join("\n")
+      : "<p>No machines are currently enrolled.</p>";
+    const safeRedirect = redirect.protocol === "https:" || ["localhost", "127.0.0.1", "[::1]", "::1"].includes(redirect.hostname);
+    const redirectWarning = safeRedirect ? "" : '<p class="warning" role="alert">Non-HTTPS, non-loopback redirect. Verify it carefully.</p>';
     const errorMarkup = error ? `<p class="error" role="alert">${escapeHtml(error)}</p>` : "";
     res.setHeader(
       "Content-Security-Policy",
@@ -402,11 +483,16 @@ export class FabricOAuthProvider implements OAuthServerProvider {
     res.status(200).type("html").send(`<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Authorize ${name}</title><style>
-body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1rem;color:#171717}fieldset{border:1px solid #bbb;border-radius:.5rem;padding:1rem}label{display:block;margin:.6rem 0}input[type=password]{width:100%;box-sizing:border-box;padding:.6rem}.actions{display:flex;gap:.75rem;margin-top:1rem}.error{color:#a00}button{padding:.6rem 1rem}
+body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1rem;color:#171717}fieldset{border:1px solid #bbb;border-radius:.5rem;padding:1rem;margin:1rem 0}label{display:block;margin:.6rem 0}input[type=password]{width:100%;box-sizing:border-box;padding:.6rem}.actions{display:flex;gap:.75rem;margin-top:1rem}.error,.warning{color:#a00;font-weight:600}code{overflow-wrap:anywhere}button{padding:.6rem 1rem}
 </style></head><body><main><h1>Authorize ${name}</h1>
-<p>This client will return to <strong>${redirectHost}</strong>.</p>${errorMarkup}
+<p><strong>unverified (self-registered)</strong> client</p>
+<p>Full redirect URI: <code>${escapeHtml(pending.redirect_uri)}</code></p>${redirectWarning}${errorMarkup}
 <form method="post" action="/oauth/approve"><input type="hidden" name="pending_id" value="${escapeHtml(pending.id)}">
 <fieldset><legend>Requested scopes</legend>${scopeControls}</fieldset>
+<fieldset><legend>Machines</legend>
+<label><input type="radio" name="machine_mode" value="all"${machineMode === "all" ? " checked" : ""}> All machines (including ones enrolled later)</label>
+<label><input type="radio" name="machine_mode" value="only"${machineMode === "only" ? " checked" : ""}> Only:</label>
+${machineControls}</fieldset>
 <label>Owner passphrase <input type="password" name="passphrase" autocomplete="current-password"></label>
 <div class="actions"><button type="submit" name="action" value="approve">Approve</button><button type="submit" name="action" value="deny">Deny</button></div>
 </form></main></body></html>`);
@@ -419,14 +505,29 @@ body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1
     return pending;
   }
 
-  approvePendingAuthorization(id: string, selectedScopes: readonly string[]): {
+  approvePendingAuthorization(
+    id: string,
+    selectedScopes: readonly string[],
+    selectedMachines: readonly string[] = [],
+    restrictMachines = false,
+  ): {
     pending: PendingAuthorizationRow;
     code: string;
   } | undefined {
     const pending = this.#getPending(id);
     if (!pending) return undefined;
     const requested = new Set(JSON.parse(pending.scopes_json) as string[]);
-    const granted = normalizeScopes(selectedScopes).filter((scope) => requested.has(scope));
+    const requestedFabric = normalizeFabricScopes([...requested]);
+    const baselineReadRequest = requestedFabric.length === 1 && requestedFabric[0] === "fabric:read";
+    const grantedFabric = normalizeFabricScopes(selectedScopes).filter((scope) => baselineReadRequest || requested.has(scope));
+    if (grantedFabric.length === 0) throw new InvalidScopeError("At least one fabric scope is required");
+    const enrolled = new Set(this.#listMachines());
+    const grantedMachines = restrictMachines
+      ? selectedMachines
+          .filter((machine, index, all) => enrolled.has(machine) && all.indexOf(machine) === index)
+          .map((machine) => `${MACHINE_SCOPE_PREFIX}${machine}`)
+      : [];
+    const granted = [...grantedFabric, ...grantedMachines];
     const code = randomId();
     this.#transaction(() => {
       this.#db
@@ -451,7 +552,18 @@ body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1
     return { pending, code };
   }
 
-  recordApprovalFailure(id: string): boolean {
+  approvalDelayMs(clientIp: string): number {
+    const now = this.#nowSeconds();
+    this.#db.prepare("DELETE FROM oauth_authorization_failures WHERE occurred_at <= ?").run(now - 15 * 60);
+    const globalCount = (this.#db.prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures").get() as { count: number }).count;
+    const ipCount = (
+      this.#db.prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures WHERE client_ip = ?").get(clientIp) as { count: number }
+    ).count;
+    const pressure = Math.max(Math.floor(globalCount / 20), Math.floor(ipCount / 10));
+    return pressure === 0 ? 0 : Math.min(5_000, 100 * 2 ** (pressure - 1));
+  }
+
+  recordApprovalFailure(id: string, clientIp = "unknown"): boolean {
     const now = this.#nowSeconds();
     return this.#transaction(() => {
       this.#db
@@ -459,9 +571,9 @@ body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1
         .run(now - 15 * 60);
       this.#db
         .prepare(
-          "INSERT INTO oauth_authorization_failures (pending_id, occurred_at) VALUES (?, ?)",
+          "INSERT INTO oauth_authorization_failures (pending_id, client_ip, occurred_at) VALUES (?, ?, ?)",
         )
-        .run(id, now);
+        .run(id, clientIp, now);
       const pendingCount = (
         this.#db
           .prepare(
@@ -469,12 +581,12 @@ body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1
           )
           .get(id) as { count: number }
       ).count;
-      const hubCount = (
+      const ipCount = (
         this.#db
-          .prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures")
-          .get() as { count: number }
+          .prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures WHERE client_ip = ?")
+          .get(clientIp) as { count: number }
       ).count;
-      const locked = pendingCount >= 5 || hubCount >= 20;
+      const locked = pendingCount >= 5 || ipCount >= 20;
       if (locked) {
         this.#db.prepare("DELETE FROM oauth_pending_authorizations WHERE id = ?").run(id);
       }
@@ -482,21 +594,91 @@ body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1
     });
   }
 
-  enforceHubApprovalLockout(id: string): boolean {
+  enforceHubApprovalLockout(id: string, clientIp = "unknown"): boolean {
     const now = this.#nowSeconds();
     return this.#transaction(() => {
       this.#db
         .prepare("DELETE FROM oauth_authorization_failures WHERE occurred_at <= ?")
         .run(now - 15 * 60);
-      const count = (
+      const pendingCount = (
         this.#db
-          .prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures")
-          .get() as { count: number }
+          .prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures WHERE pending_id = ?")
+          .get(id) as { count: number }
       ).count;
-      if (count < 20) return false;
+      const ipCount = (
+        this.#db
+          .prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures WHERE client_ip = ?")
+          .get(clientIp) as { count: number }
+      ).count;
+      if (pendingCount < 5 && ipCount < 20) return false;
       this.#db.prepare("DELETE FROM oauth_pending_authorizations WHERE id = ?").run(id);
       return true;
     });
+  }
+
+  validateAuthorizationRequest(params: Record<string, unknown>): string | null {
+    for (const name of [
+      "client_id",
+      "redirect_uri",
+      "response_type",
+      "code_challenge",
+      "code_challenge_method",
+      "scope",
+      "resource",
+      "state",
+    ]) {
+      if (Array.isArray(params[name])) return `${name} must appear at most once.`;
+    }
+    const value = (name: string) => (typeof params[name] === "string" ? params[name] : undefined);
+    const clientId = value("client_id");
+    const client = clientId ? this.#getClient(clientId) : undefined;
+    if (!client) return "Unknown OAuth client.";
+    const redirectUri =
+      value("redirect_uri") ??
+      (client.redirect_uris.length === 1 ? client.redirect_uris[0] : undefined);
+    if (!redirectUri || !client.redirect_uris.some((registered) => redirectUriMatches(redirectUri, registered))) {
+      return "The redirect URI is not registered for this client.";
+    }
+    if (value("response_type") !== "code") return "response_type must be code.";
+    if (!value("code_challenge")) return "code_challenge is required.";
+    if (value("code_challenge_method") !== "S256") return "code_challenge_method must be S256.";
+    const resource = value("resource");
+    if (resource !== undefined) {
+      try {
+        const requestedResource = new URL(resource);
+        if (requestedResource.href !== this.#mcpResourceUrl.href) {
+          return "The requested resource is not served by this hub.";
+        }
+      } catch {
+        return "resource must be a valid URL.";
+      }
+    }
+    const scope = value("scope");
+    if (scope !== undefined) {
+      const sane = scope
+        .split(" ")
+        .filter(Boolean)
+        .every((entry) => /^[A-Za-z0-9:._-]+$/.test(entry));
+      if (!sane) return "scope contains an unsupported value.";
+    }
+    return null;
+  }
+
+  pruneOAuthStorage(protectedClientId?: string): void {
+    const now = this.#nowSeconds();
+    this.#db.prepare("DELETE FROM oauth_pending_authorizations WHERE expires_at <= ?").run(now);
+    this.#db.prepare("DELETE FROM oauth_authorization_codes WHERE expires_at <= ?").run(now);
+    const protectedClause = protectedClientId ? " AND client_id <> ?" : "";
+    const params: Array<string | number> = [now - 30 * 24 * 60 * 60];
+    if (protectedClientId) params.push(protectedClientId);
+    this.#db
+      .prepare(
+        `DELETE FROM oauth_clients
+          WHERE token_issued_at IS NULL AND created_at < ?${protectedClause}
+            AND client_id NOT IN (SELECT client_id FROM oauth_pending_authorizations)
+            AND client_id NOT IN (SELECT client_id FROM oauth_authorization_codes)`,
+      )
+      .run(...params);
   }
 
   async revokeToken(
@@ -698,14 +880,17 @@ body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1
   #registerClient(
     client: Omit<OAuthClientInformationFull, "client_id" | "client_id_issued_at">,
   ): OAuthClientInformationFull {
+    this.pruneOAuthStorage();
+    const count = (this.#db.prepare("SELECT COUNT(*) AS count FROM oauth_clients").get() as { count: number }).count;
+    if (count >= 500) throw new InvalidRequestError("This hub has reached its registered-client limit");
     const registered: OAuthClientInformationFull = {
       ...client,
       client_id: randomId(),
       client_id_issued_at: this.#nowSeconds(),
     };
     this.#db
-      .prepare("INSERT INTO oauth_clients (client_id, info_json) VALUES (?, ?)")
-      .run(registered.client_id, JSON.stringify(registered));
+      .prepare("INSERT INTO oauth_clients (client_id, info_json, created_at, token_issued_at) VALUES (?, ?, ?, NULL)")
+      .run(registered.client_id, JSON.stringify(registered), this.#nowSeconds());
     return registered;
   }
 
@@ -717,7 +902,9 @@ body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS oauth_clients (
         client_id TEXT PRIMARY KEY,
-        info_json TEXT NOT NULL
+        info_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL DEFAULT 0,
+        token_issued_at INTEGER
       );
       CREATE TABLE IF NOT EXISTS oauth_owner_credentials (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -789,6 +976,7 @@ body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1
       CREATE TABLE IF NOT EXISTS oauth_authorization_failures (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         pending_id TEXT NOT NULL,
+        client_ip TEXT NOT NULL DEFAULT '',
         occurred_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS oauth_authorization_failures_pending_time
@@ -796,6 +984,27 @@ body{font:16px system-ui,sans-serif;max-width:38rem;margin:4rem auto;padding:0 1
       CREATE INDEX IF NOT EXISTS oauth_authorization_failures_time
         ON oauth_authorization_failures (occurred_at);
     `);
+    this.#ensureColumn("oauth_clients", "created_at", "INTEGER NOT NULL DEFAULT 0");
+    this.#ensureColumn("oauth_clients", "token_issued_at", "INTEGER");
+    this.#ensureColumn("oauth_authorization_failures", "client_ip", "TEXT NOT NULL DEFAULT ''");
+    this.#db.prepare("UPDATE oauth_clients SET created_at = ? WHERE created_at = 0").run(this.#nowSeconds());
+    this.#db.exec(`
+      UPDATE oauth_clients
+         SET token_issued_at = (
+           SELECT MAX(created_at) FROM oauth_token_families
+            WHERE oauth_token_families.client_id = oauth_clients.client_id
+         )
+       WHERE token_issued_at IS NULL
+         AND EXISTS (SELECT 1 FROM oauth_token_families WHERE oauth_token_families.client_id = oauth_clients.client_id)
+    `);
+    this.#db.exec(
+      "CREATE INDEX IF NOT EXISTS oauth_authorization_failures_ip_time ON oauth_authorization_failures (client_ip, occurred_at)",
+    );
+  }
+
+  #ensureColumn(table: string, column: string, definition: string): void {
+    const columns = this.#db.prepare(`PRAGMA table_info(${table})`).all() as unknown as Array<{ name: string }>;
+    if (!columns.some((entry) => entry.name === column)) this.#db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
   }
 }
 
@@ -813,7 +1022,22 @@ export function createOAuthRouter({
   resourceName,
 }: OAuthRouterOptions): Router {
   const router = express.Router();
-  router.post("/oauth/approve", express.urlencoded({ extended: false }), (req, res) => {
+  router.all("/authorize", express.urlencoded({ extended: false }), (req, res, next) => {
+    const params = (req.method === "POST" ? req.body : req.query) as Record<string, unknown>;
+    const error = provider.validateAuthorizationRequest(params);
+    if (!error) {
+      next();
+      return;
+    }
+    res.setHeader("Cache-Control", "no-store");
+    res.setHeader("X-Frame-Options", "DENY");
+    res
+      .status(400)
+      .type("html")
+      .send(`<!doctype html><title>Invalid authorization request</title><p>${escapeHtml(error)}</p>`);
+  });
+  router.post("/oauth/approve", express.urlencoded({ extended: false }), async (req, res) => {
+    provider.pruneOAuthStorage();
     const pendingId = typeof req.body.pending_id === "string" ? req.body.pending_id : "";
     const action = typeof req.body.action === "string" ? req.body.action : "";
     const pending = provider.getPendingAuthorization(pendingId);
@@ -839,7 +1063,10 @@ export function createOAuthRouter({
         .send("<!doctype html><title>Invalid request</title><p>Unknown approval action.</p>");
       return;
     }
-    if (provider.enforceHubApprovalLockout(pendingId)) {
+    const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+    const delayMs = provider.approvalDelayMs(clientIp);
+    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
+    if (provider.enforceHubApprovalLockout(pendingId, clientIp)) {
       res
         .status(429)
         .type("html")
@@ -853,19 +1080,38 @@ export function createOAuthRouter({
         : Array.isArray(submitted)
           ? submitted.filter((scope): scope is string => typeof scope === "string")
           : [];
+    const submittedMachines = req.body.machine;
+    const selectedMachines =
+      typeof submittedMachines === "string"
+        ? [submittedMachines]
+        : Array.isArray(submittedMachines)
+          ? submittedMachines.filter((machine): machine is string => typeof machine === "string")
+          : [];
+    const machineMode = req.body.machine_mode === "only" ? "only" : "all";
     const passphrase = typeof req.body.passphrase === "string" ? req.body.passphrase : "";
     if (!provider.verifyOwnerPassphrase(passphrase)) {
-      if (provider.recordApprovalFailure(pendingId)) {
+      if (provider.recordApprovalFailure(pendingId, clientIp)) {
         res
           .status(429)
           .type("html")
           .send("<!doctype html><title>Too many attempts</title><p>Too many failed attempts. Start a new authorization request.</p>");
         return;
       }
-      provider.renderConsentPage(pending, res, "Incorrect passphrase", selectedScopes);
+      provider.renderConsentPage(pending, res, "Incorrect passphrase", selectedScopes, selectedMachines, machineMode);
       return;
     }
-    const approved = provider.approvePendingAuthorization(pendingId, selectedScopes);
+    const grantedFabric = normalizeFabricScopes(selectedScopes);
+    if (grantedFabric.length === 0) {
+      provider.renderConsentPage(pending, res, "Select at least one fabric scope", selectedScopes, selectedMachines, machineMode);
+      return;
+    }
+    const validMachines = new Set(provider.listMachines());
+    const grantedMachines = selectedMachines.filter((machine) => validMachines.has(machine));
+    if (machineMode === "only" && grantedMachines.length === 0) {
+      provider.renderConsentPage(pending, res, "Select at least one enrolled machine or choose all machines", selectedScopes, selectedMachines, machineMode);
+      return;
+    }
+    const approved = provider.approvePendingAuthorization(pendingId, grantedFabric, grantedMachines, machineMode === "only");
     if (!approved) {
       res.status(400).type("html").send("<!doctype html><title>Invalid request</title><p>This authorization request is invalid or expired.</p>");
       return;
@@ -895,6 +1141,7 @@ export function bearerMiddleware(provider: FabricOAuthProvider, mcpResourceUrl: 
   const resource = new URL(String(mcpResourceUrl));
   return requireBearerAuth({
     verifier: provider,
+    requiredScopes: ["fabric:read"],
     expectedResource: resource,
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(resource),
   });

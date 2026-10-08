@@ -31,7 +31,7 @@ function deadlineFor(tool: string, args: Record<string, unknown>): number {
   return 30_000;
 }
 
-function rowView(r: RequestRow) {
+export function requestRowView(r: RequestRow) {
   return {
     request_id: r.request_id,
     machine: r.machine,
@@ -45,6 +45,56 @@ function rowView(r: RequestRow) {
     idempotency_key: r.idempotency_key,
     args: JSON.parse(r.args_summary),
   };
+}
+
+function machineScopes(scopes: readonly string[]): string[] {
+  return scopes.filter((scope) => scope.startsWith("machine:")).map((scope) => scope.slice("machine:".length));
+}
+
+export function hasAllMachineAccess(scopes: readonly string[]): boolean {
+  return machineScopes(scopes).length === 0;
+}
+
+export function allowedMachineNames(enrolled: readonly string[], scopes: readonly string[]): string[] {
+  const restricted = new Set(machineScopes(scopes));
+  return restricted.size === 0 ? [...enrolled] : enrolled.filter((machine) => restricted.has(machine));
+}
+
+export function isOwnerLevelCaller(caller: CallerInfo): boolean {
+  return hasAllMachineAccess(caller.scopes) && caller.scopes.includes("fabric:exec");
+}
+
+function canSeeRequest(caller: CallerInfo, allowedMachines: readonly string[], row: RequestRow): boolean {
+  return allowedMachines.includes(row.machine) && (row.principal === caller.principal || isOwnerLevelCaller(caller));
+}
+
+export function visibleRequestRows(
+  store: HubStore,
+  caller: CallerInfo,
+  allowedMachines: readonly string[],
+  limit: number,
+  machine?: string,
+): RequestRow[] {
+  if (machine && !allowedMachines.includes(machine)) return [];
+  if (allowedMachines.length === 0) return [];
+  const clauses: string[] = [];
+  const params: Array<string | number> = [];
+  if (machine) {
+    clauses.push("machine = ?");
+    params.push(machine);
+  } else if (!hasAllMachineAccess(caller.scopes)) {
+    clauses.push(`machine IN (${allowedMachines.map(() => "?").join(", ")})`);
+    params.push(...allowedMachines);
+  }
+  if (!isOwnerLevelCaller(caller)) {
+    clauses.push("principal = ?");
+    params.push(caller.principal);
+  }
+  const where = clauses.length > 0 ? ` WHERE ${clauses.join(" AND ")}` : "";
+  params.push(limit);
+  return store.db
+    .prepare(`SELECT * FROM requests${where} ORDER BY created_at DESC LIMIT ?`)
+    .all(...params) as unknown as RequestRow[];
 }
 
 /**
@@ -89,12 +139,12 @@ export function createMcpServer(ctx: McpContext, caller: CallerInfo): McpServer 
     },
   );
 
-  const machines = ctx.store
+  const enrolledMachines = ctx.store
     .listDevices()
     .filter((d) => !d.revoked_at)
     .map((d) => d.name);
-  const machineSchema =
-    machines.length > 0 ? z.enum(machines as [string, ...string[]]).describe(MACHINE_HELP) : z.string().describe(MACHINE_HELP);
+  const machines = allowedMachineNames(enrolledMachines, caller.scopes);
+  const machineSchema = advertisedMachineSchema(machines);
 
   server.registerTool(
     "list_machines",
@@ -106,7 +156,9 @@ export function createMcpServer(ctx: McpContext, caller: CallerInfo): McpServer 
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async () => {
-      const health = ctx.registry.allHealth();
+      if (!caller.scopes.includes("fabric:read")) return missingScope("fabric:read", "list_machines");
+      const allowed = new Set(machines);
+      const health = ctx.registry.allHealth().filter((machine) => allowed.has(machine.machine));
       const lines = health.map((h) => {
         const pol = h.agent ? ` roots=${h.agent.policy.roots.join(",")}${h.agent.policy.read_only ? " READ-ONLY" : ""}${h.agent.policy.allow_exec ? "" : " no-exec"}` : "";
         const where = h.agent ? ` ${h.agent.platform}/${h.agent.arch} host=${h.agent.hostname}` : "";
@@ -127,9 +179,10 @@ export function createMcpServer(ctx: McpContext, caller: CallerInfo): McpServer 
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ request_id }) => {
+      if (!caller.scopes.includes("fabric:read")) return missingScope("fabric:read", "get_request_status");
       const row = ctx.store.getRequest(request_id);
-      if (!row) return hubError(`No request with id ${request_id}.`, { request_id });
-      const view = rowView(row);
+      if (!row || !canSeeRequest(caller, machines, row)) return hubError(`No request with id ${request_id}.`, { request_id });
+      const view = requestRowView(row);
       const outcome = row.outcome_json ? (JSON.parse(row.outcome_json) as ToolOutcome) : null;
       const text =
         `${row.request_id} ${row.tool} on ${row.machine}: ${row.state}` +
@@ -150,7 +203,8 @@ export function createMcpServer(ctx: McpContext, caller: CallerInfo): McpServer 
       annotations: { readOnlyHint: true, openWorldHint: false },
     },
     async ({ machine, limit }) => {
-      const rows = ctx.store.recentRequests(limit ?? 20, machine).map(rowView);
+      if (!caller.scopes.includes("fabric:read")) return missingScope("fabric:read", "list_recent_requests");
+      const rows = visibleRequestRows(ctx.store, caller, machines, limit ?? 20, machine).map(requestRowView);
       const text = rows
         .map((r) => `${r.created_at} ${r.request_id} ${r.machine} ${r.tool} ${r.state}${r.error_code ? ` (${r.error_code})` : ""}`)
         .join("\n");
@@ -181,7 +235,9 @@ function registerAgentTool(server: McpServer, ctx: McpContext, caller: CallerInf
       const { machine, idempotency_key, ...args } = rawArgs as { machine: string; idempotency_key?: string } & Record<string, unknown>;
       const requestId = newRequestId();
       const base = { request_id: requestId, machine, tool: spec.name };
-      const needed = SCOPE_FOR_EFFECT[spec.effect];
+      const needed = spec.scope ?? SCOPE_FOR_EFFECT[spec.effect];
+      const enrolled = ctx.store.listDevices().filter((device) => !device.revoked_at).map((device) => device.name);
+      const allowedMachines = allowedMachineNames(enrolled, caller.scopes);
 
       const record = (state: "not_dispatched" | "dispatched", key: string | null) =>
         ctx.store.createRequest({
@@ -194,6 +250,16 @@ function registerAgentTool(server: McpServer, ctx: McpContext, caller: CallerInf
           args_summary: summarizeArgs(args),
           state,
         });
+
+      if (!allowedMachines.includes(machine)) {
+        record("not_dispatched", null);
+        ctx.store.finish(requestId, { ok: false, code: "policy_denied", message: `machine ${machine} is outside this grant` }, false);
+        return hubError(`This connection was not granted access to machine ${machine}.`, {
+          ...base,
+          state: "not_dispatched",
+          error_code: "policy_denied",
+        });
+      }
 
       if (!caller.scopes.includes(needed)) {
         record("not_dispatched", null);
@@ -256,4 +322,24 @@ function registerAgentTool(server: McpServer, ctx: McpContext, caller: CallerInf
       meta,
     );
   }
+}
+
+function missingScope(scope: string, tool: string): CallToolResult {
+  return hubError(`This connection was not granted ${scope}; ${tool} is not allowed.`, {
+    tool,
+    state: "not_dispatched",
+    error_code: "policy_denied",
+  });
+}
+
+function advertisedMachineSchema(machines: string[]): z.ZodTypeAny {
+  const schema = z.string().describe(MACHINE_HELP);
+  if (machines.length === 0) return schema;
+  // The public schema is an enum for client UX, but authorization cannot rely
+  // on client-side/schema validation. Keep parsing permissive so a forged name
+  // reaches the explicit policy-denied branch above and is recorded.
+  const definition = (schema as unknown as { _def: { typeName: string; values?: string[] } })._def;
+  definition.typeName = z.ZodFirstPartyTypeKind.ZodEnum;
+  definition.values = machines;
+  return schema;
 }

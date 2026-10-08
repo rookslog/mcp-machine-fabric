@@ -20,6 +20,11 @@ public issue for anything exploitable. We aim to acknowledge within 7 days.
   owner-passphrase consent, refresh-token rotation with reuse detection) or
   personal access tokens (`mmf_pat_…`, stored hashed). Scopes:
   `fabric:read`, `fabric:write`, `fabric:exec`, enforced by the hub per call.
+  Optional `machine:<name>` scopes restrict access to named machines; no
+  machine scope means all machines for backwards compatibility. Non-owner
+  callers see only their own audit rows, job output requires `fabric:exec`, and
+  only an all-machine caller with `fabric:exec` receives owner-level audit
+  visibility.
 - **Agent-side policy** (allowed roots after symlink resolution, read-only
   mode, exec on/off) is enforced on the controlled machine itself.
   Exec cannot be confined by roots: a shell can reach anything the agent's OS

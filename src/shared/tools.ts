@@ -14,6 +14,8 @@ export interface AgentToolSpec {
   title: string;
   description: string;
   effect: Effect;
+  /** Authorization scope override when the operation is more sensitive than its read-only annotation. */
+  scope?: "fabric:read" | "fabric:write" | "fabric:exec";
   /** Safe to repeat with identical arguments (MCP idempotentHint). */
   idempotent: boolean;
   /** May destroy or overwrite data (MCP destructiveHint). */
@@ -172,6 +174,7 @@ export const AGENT_TOOLS: AgentToolSpec[] = [
     description:
       "Read a job's combined stdout/stderr from byte `cursor` (default 0). Returns new output, the next cursor, and status (running/exited/killed/lost) with exit code. Optionally wait up to `wait_seconds` for new output or exit.",
     effect: "read",
+    scope: "fabric:exec",
     idempotent: true,
     destructive: false,
     shape: {
@@ -186,6 +189,7 @@ export const AGENT_TOOLS: AgentToolSpec[] = [
     title: "List jobs",
     description: "List durable jobs on the machine (most recent first) with status, exit code, and age.",
     effect: "read",
+    scope: "fabric:exec",
     idempotent: true,
     destructive: false,
     shape: {

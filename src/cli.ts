@@ -17,7 +17,7 @@ Hub (run on the always-on host):
   mmf passphrase                      set the owner passphrase (read from stdin)
   mmf device add <name>               enroll a machine; prints its device token ONCE
   mmf device list | revoke <name>
-  mmf token create <name> [--scopes fabric:read,fabric:write,fabric:exec]
+  mmf token create <name> [--scopes fabric:read,fabric:write,fabric:exec] [--machines a,b]
   mmf token list | revoke <id>        personal access tokens for CLI MCP clients
   mmf status [--url URL] [--token-file F]   machine health as the hub sees it
 
@@ -39,7 +39,11 @@ function publicUrl(flag: string | undefined, port: number): string {
 
 function openProvider(dir: string, pub: string) {
   const store = new HubStore(dir);
-  const provider = new FabricOAuthProvider({ db: store.db, mcpResourceUrl: `${pub}/mcp` });
+  const provider = new FabricOAuthProvider({
+    db: store.db,
+    mcpResourceUrl: `${pub}/mcp`,
+    listMachines: () => store.listDevices().filter((device) => !device.revoked_at).map((device) => device.name),
+  });
   return { store, provider };
 }
 
@@ -137,14 +141,26 @@ async function main(argv: string[]): Promise<number> {
     }
     case "token": {
       const [sub, ...more] = rest;
-      const { values, positionals } = parseArgs({ args: more, options: { scopes: { type: "string" } }, allowPositionals: true });
+      const { values, positionals } = parseArgs({
+        args: more,
+        options: { scopes: { type: "string" }, machines: { type: "string" } },
+        allowPositionals: true,
+      });
       const pub = publicUrl(undefined, 8787);
       const { store, provider } = openProvider(dataDir(), pub);
       try {
         if (sub === "create" && positionals[0]) {
           const scopes = values.scopes ? values.scopes.split(",").map((s) => s.trim()) : [...SCOPES];
-          const { id, token } = provider.createPersonalToken(positionals[0], scopes);
-          console.log(`Created token ${id} (${scopes.join(" ")}). Shown once:\n${token}`);
+          const requestedMachines = values.machines?.split(",").map((machine) => machine.trim()).filter(Boolean);
+          if (values.machines !== undefined && requestedMachines?.length === 0) {
+            throw new Error("--machines must name at least one enrolled machine");
+          }
+          const activeMachines = new Set(store.listDevices().filter((device) => !device.revoked_at).map((device) => device.name));
+          const unknownMachines = requestedMachines?.filter((machine) => !activeMachines.has(machine)) ?? [];
+          if (unknownMachines.length > 0) throw new Error(`unknown or revoked machine: ${unknownMachines.join(", ")}`);
+          const grant = [...scopes, ...(requestedMachines ?? []).map((machine) => `machine:${machine}`)];
+          const { id, token } = provider.createPersonalToken(positionals[0], grant);
+          console.log(`Created token ${id} (${grant.join(" ")}). Shown once:\n${token}`);
         } else if (sub === "list") {
           for (const t of provider.listPersonalTokens()) console.log(JSON.stringify(t));
         } else if (sub === "revoke" && positionals[0]) {

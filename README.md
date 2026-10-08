@@ -132,8 +132,11 @@ Service templates: [systemd](deploy/systemd/mmf-agent.service) (note
 
 Read [SECURITY.md](SECURITY.md). In short: a hub URL plus a token with
 `fabric:exec` is a shell on every enrolled machine, within each agent's local
-policy. Scopes are enforced at the hub; roots/read-only/no-exec are enforced on
-the agent.
+policy. Fabric scopes are enforced at the hub; optional `machine:<name>` scopes
+restrict a connector or PAT to named machines, while no machine scope preserves
+access to all machines. Audit rows are principal-scoped unless an all-machine
+`fabric:exec` caller performs owner-level review, and job output requires
+`fabric:exec`. Roots/read-only/no-exec are enforced on the agent.
 
 ## More docs
 
