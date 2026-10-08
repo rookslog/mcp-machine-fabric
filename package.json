@@ -1,0 +1,42 @@
+{
+  "name": "mcp-machine-fabric",
+  "version": "0.1.0",
+  "description": "Self-hosted, open-source remote machine control for MCP clients: one hub, many outbound agents, durable jobs, auditable requests.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "mmf": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "start:hub": "node dist/cli.js hub",
+    "start:agent": "node dist/cli.js agent"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "express": "^5.1.0",
+    "ws": "^8.22.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.9.2",
+    "vitest": "^3.2.4"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  }
+}
