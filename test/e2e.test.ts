@@ -197,6 +197,17 @@ describe("hub + agents end to end", () => {
     expect(x.structuredContent!.error_code).toBe("policy_denied");
   });
 
+  it("disconnects a connected agent once its device is revoked, and refuses its reconnect", async () => {
+    const c = await h.client();
+    expect(h.store.revokeDevice("beta")).toBe(true);
+    await waitFor(async () => !h.hub.registry.isConnected("beta"), 5000);
+    const r = await call(c, "read_file", { machine: "beta", path: nodePath.join(h.agents.beta.root, "x") });
+    // A revoked machine is no longer offered in the `machine` enum, so the call is rejected outright.
+    expect(r.isError).toBe(true);
+    await new Promise((res) => setTimeout(res, 600));
+    expect(h.hub.registry.isConnected("beta")).toBe(false);
+  });
+
   it("records an audit trail with summarized arguments", async () => {
     const c = await h.client();
     const big = "x".repeat(5000);
