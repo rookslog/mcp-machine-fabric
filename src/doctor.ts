@@ -113,13 +113,6 @@ export async function runDoctor(options: DoctorOptions = {}, output: (line: stri
     const handshake = await probeWebSocket(hub.url, token, timeoutMs);
     if (handshake.kind === "welcome") {
       add("websocket", "hub WebSocket", "PASS", `connected as ${handshake.machine}`, "none");
-      add(
-        "websocket_effect",
-        "hub probe safety",
-        "WARN",
-        "the current hub registers this diagnostic connection and may briefly replace an active agent",
-        "run doctor during a maintenance window until the hub provides a non-registering diagnostic handshake",
-      );
     } else if (handshake.kind === "unauthorized") {
       add("websocket", "hub WebSocket", "FAIL", "token revoked or wrong hub", "enroll the machine again and replace the device token");
     } else {
@@ -259,7 +252,11 @@ type HandshakeResult =
 
 async function probeWebSocket(url: URL, token: string, timeoutMs: number): Promise<HandshakeResult> {
   return await new Promise((resolve) => {
-    const socket = new WebSocket(url, { headers: { Authorization: `Bearer ${token}` } });
+    // ?probe=1: the hub authenticates and answers `welcome` without
+    // registering, so diagnosing never displaces the running agent.
+    const probeUrl = new URL(url.href);
+    probeUrl.searchParams.set("probe", "1");
+    const socket = new WebSocket(probeUrl, { headers: { Authorization: `Bearer ${token}` } });
     let settled = false;
     const finish = (result: HandshakeResult) => {
       if (settled) return;

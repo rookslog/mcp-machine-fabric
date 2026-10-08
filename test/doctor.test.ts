@@ -67,8 +67,34 @@ describe("runDoctor", () => {
     expect(result.exitCode).toBe(0);
     expect(check(result, "tcp")).toMatchObject({ status: "PASS" });
     expect(check(result, "websocket")).toMatchObject({ status: "PASS", message: expect.stringContaining("doctor-good") });
-    expect(check(result, "websocket_effect")).toMatchObject({ status: "WARN" });
     expect(lines.every((line) => /^(PASS|WARN|FAIL) .+ — fix: .+/.test(line))).toBe(true);
+  });
+
+  test("does not displace a running agent's connection", async () => {
+    const harness = await makeHarness(["live"]);
+    harnesses.add(harness);
+    const agent = await harness.startAgent("live");
+    let closes = 0;
+    harness.hub.registry; // connection established
+    const tokenFile = path.join(harness.dir, "live.token");
+    await writeFile(tokenFile, `${harness.agents.live.token}\n`, { mode: 0o600 });
+    const before = harness.hub.registry.health("live").connected_since;
+    const result = await runDoctor(
+      {
+        hubUrl: `ws://127.0.0.1:${harness.port}/agent`,
+        tokenFile,
+        env: { ...process.env, MMF_ROOTS: harness.agents.live.root, MMF_STATE_DIR: harness.agents.live.stateDir },
+        homeDir: harness.dir,
+        platform: process.platform,
+        timeoutMs: 2_000,
+      },
+      () => closes++,
+    );
+    expect(check(result, "websocket")).toMatchObject({ status: "PASS" });
+    await new Promise((r) => setTimeout(r, 300));
+    expect(harness.hub.registry.isConnected("live")).toBe(true);
+    expect(harness.hub.registry.health("live").connected_since).toBe(before);
+    expect(agent.machine).toBe("live");
   });
 
   test("reports a revoked device token as an authentication failure", async () => {

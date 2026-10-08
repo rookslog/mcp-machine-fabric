@@ -138,6 +138,15 @@ export function createHub(opts: HubOptions): Hub {
       socket.end("HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n");
       return;
     }
+    if (url.searchParams.get("probe") === "1") {
+      // Diagnostic handshake (mmf doctor): prove the token and identity
+      // without registering, so a live agent connection is never displaced.
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        ws.send(JSON.stringify({ type: "welcome", machine: device.name, hub_version: opts.hubVersion, protocol_version: 1, probe: true }));
+        ws.close(1000, "probe");
+      });
+      return;
+    }
     wss.handleUpgrade(req, socket, head, (ws) => {
       log("agent connected", { machine: device.name });
       registry.attach(device.name, device.id, ws);
