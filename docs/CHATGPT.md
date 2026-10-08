@@ -121,7 +121,7 @@ The tailnet owner/admin must enable HTTPS and Funnel/Serve permissions for the n
 1. Set the externally visible URL in `~/.config/mmf/hub.env`:
 
    ```dotenv
-   MMF_PUBLIC_URL=https://dionysus.tail0528f0.ts.net:8443
+   MMF_PUBLIC_URL=https://<node>.<tailnet>.ts.net:8443
    ```
 
 2. Set the OAuth owner passphrase if it is not already configured:
@@ -143,18 +143,18 @@ The tailnet owner/admin must enable HTTPS and Funnel/Serve permissions for the n
 
 ```bash
 tailscale funnel status
-curl -fsS https://dionysus.tail0528f0.ts.net:8443/readyz
-curl -fsS https://dionysus.tail0528f0.ts.net:8443/.well-known/oauth-protected-resource/mcp
-curl -fsS https://dionysus.tail0528f0.ts.net:8443/.well-known/oauth-authorization-server
+curl -fsS https://<node>.<tailnet>.ts.net:8443/readyz
+curl -fsS https://<node>.<tailnet>.ts.net:8443/.well-known/oauth-protected-resource/mcp
+curl -fsS https://<node>.<tailnet>.ts.net:8443/.well-known/oauth-authorization-server
 ```
 
 Check the returned values, not only HTTP status:
 
-- protected-resource `resource` must be `https://dionysus.tail0528f0.ts.net:8443/mcp`;
+- protected-resource `resource` must be `https://<node>.<tailnet>.ts.net:8443/mcp`;
 - `authorization_servers[0]` must use the same public HTTPS origin;
 - authorization-server `issuer`, `authorization_endpoint`, `token_endpoint`, and `registration_endpoint` must all be browser-reachable HTTPS URLs on that origin.
 
-In ChatGPT, create a custom MCP app with endpoint `https://dionysus.tail0528f0.ts.net:8443/mcp`, select OAuth, complete the browser consent page with the owner passphrase, scan tools, and test a read-only action first.
+In ChatGPT, create a custom MCP app with endpoint `https://<node>.<tailnet>.ts.net:8443/mcp`, select OAuth, complete the browser consent page with the owner passphrase, scan tools, and test a read-only action first.
 
 This route is not currently verified. Enabling Funnel, changing `MMF_PUBLIC_URL`, restarting the hub, and completing OAuth consent are owner-controlled external-state changes.
 

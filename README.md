@@ -82,7 +82,9 @@ tailscale serve --bg --https=8443 http://127.0.0.1:8787
 tailscale funnel --bg --https=8443 http://127.0.0.1:8787
 ```
 
-A user systemd unit is in [deploy/systemd/mmf-hub.service](deploy/systemd/mmf-hub.service).
+A user systemd unit is in [deploy/systemd/mmf-hub.service](deploy/systemd/mmf-hub.service)
+(`scripts/install-hub.sh` installs it); a [Dockerfile](Dockerfile) is provided too.
+Check health any time with `MMF_TOKEN=… mmf status --url https://<hub>`.
 
 ### 2. Agents
 
@@ -92,8 +94,14 @@ On the hub host:
 mmf device add laptop                    # prints a device token once
 ```
 
-On the machine to control, save the token to `~/.config/mmf/agent.token`
-(mode 0600) and run:
+On the machine to control, the easiest path is the installer (systemd on Linux,
+launchd on macOS; it stores the token with mode 0600):
+
+```bash
+echo '<device token>' | ./scripts/install-agent.sh --hub wss://hub.example.ts.net:8443/agent --root ~
+```
+
+Or run it in the foreground:
 
 ```bash
 mmf agent --hub wss://hub.example.ts.net:8443/agent --token-file ~/.config/mmf/agent.token \
@@ -126,6 +134,12 @@ Read [SECURITY.md](SECURITY.md). In short: a hub URL plus a token with
 `fabric:exec` is a shell on every enrolled machine, within each agent's local
 policy. Scopes are enforced at the hub; roots/read-only/no-exec are enforced on
 the agent.
+
+## More docs
+
+- [docs/CHATGPT.md](docs/CHATGPT.md) — connecting ChatGPT (OpenAI Secure MCP Tunnel or public HTTPS)
+- [docs/SELF_HOSTING.md](docs/SELF_HOSTING.md) — hosting your own hub (systemd or Docker), TLS, backups, upgrades
+- [docs/STATUS.md](docs/STATUS.md) — what is verified and what is not
 
 ## Design
 
