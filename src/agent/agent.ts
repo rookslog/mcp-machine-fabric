@@ -36,6 +36,8 @@ export interface AgentOptions {
   stateDir: string;
   capacity?: number;
   log?: (msg: string, extra?: Record<string, unknown>) => void;
+  /** Finished jobs older than this are deleted from disk (default 7 days). */
+  jobRetentionMs?: number;
   /** Reconnect backoff bounds (ms). */
   minBackoffMs?: number;
   maxBackoffMs?: number;
@@ -175,6 +177,7 @@ export class Agent {
   private backoff: number;
   private reconnectTimer: NodeJS.Timeout | null = null;
   private healthTimer: NodeJS.Timeout | null = null;
+  private pruneTimer: NodeJS.Timeout | null = null;
   private loopLag = 0;
   readonly startedAt = new Date().toISOString();
   machine: string | null = null;
@@ -206,6 +209,19 @@ export class Agent {
   async start(): Promise<void> {
     await this.executor.init();
     await this.cache.init();
+    const retention = this.opts.jobRetentionMs ?? 7 * 24 * 3600 * 1000;
+    const prune = async () => {
+      try {
+        const n = await this.executor.jobs.prune(retention);
+        if (n > 0) this.log("pruned finished jobs", { count: n });
+        await this.cache.prune();
+      } catch (err) {
+        this.log("prune failed", { error: String(err) });
+      }
+    };
+    await prune();
+    this.pruneTimer = setInterval(() => void prune(), 6 * 3600 * 1000);
+    this.pruneTimer.unref();
     this.connect();
     this.healthTimer = setInterval(() => {
       const t0 = Date.now();
@@ -344,6 +360,7 @@ export class Agent {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.healthTimer) clearInterval(this.healthTimer);
+    if (this.pruneTimer) clearInterval(this.pruneTimer);
     const ws = this.ws;
     if (ws && ws.readyState !== WebSocket.CLOSED) {
       await new Promise<void>((r) => {

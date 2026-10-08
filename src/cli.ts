@@ -26,7 +26,7 @@ Agent (run on every machine you want to control):
             (or MMF_AGENT_TOKEN in the environment)
 
 Environment: hub: MMF_DATA_DIR (default ~/.local/share/mmf-hub), MMF_PUBLIC_URL, MMF_PORT, MMF_HOST (comma-separated addresses)
-             agent: MMF_HUB_URL, MMF_AGENT_TOKEN, MMF_ROOTS (colon-separated), MMF_READ_ONLY=1, MMF_NO_EXEC=1, MMF_STATE_DIR
+             agent: MMF_HUB_URL, MMF_AGENT_TOKEN, MMF_ROOTS (colon-separated), MMF_READ_ONLY=1, MMF_NO_EXEC=1, MMF_STATE_DIR, MMF_JOB_RETENTION_DAYS (default 7)
 `;
 
 function dataDir(flag?: string): string {
@@ -186,7 +186,8 @@ async function main(argv: string[]): Promise<number> {
       });
       const log = jsonLogger("agent");
       const stateDir = values["state-dir"] ?? process.env.MMF_STATE_DIR ?? nodePath.join(homedir(), ".local/state/mmf-agent");
-      const agent = new Agent({ hubUrl, token, policy, stateDir, log });
+      const retentionDays = Number(process.env.MMF_JOB_RETENTION_DAYS ?? 7);
+      const agent = new Agent({ hubUrl, token, policy, stateDir, log, jobRetentionMs: Math.max(0.01, retentionDays) * 24 * 3600 * 1000 });
       await agent.start();
       log("agent started", { hub: hubUrl, policy, state_dir: stateDir });
       const shutdown = async (sig: string) => {
