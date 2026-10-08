@@ -90,7 +90,7 @@ export function createHub(opts: HubOptions): Hub {
   });
   app.get("/api/requests", bearer, (req, res) => {
     const caller = callerOf(req);
-    const limit = Math.min(Number(req.query.limit ?? 50) || 50, 500);
+    const limit = Math.max(1, Math.min(Number(req.query.limit ?? 50) || 50, 500));
     const enrolled = store.listDevices().filter((device) => !device.revoked_at).map((device) => device.name);
     const allowed = allowedMachineNames(enrolled, caller.scopes);
     const rows = visibleRequestRows(store, caller, allowed, limit, typeof req.query.machine === "string" ? req.query.machine : undefined);
@@ -101,7 +101,7 @@ export function createHub(opts: HubOptions): Hub {
     res.type("html").send(renderDashboard(opts.hubVersion));
   });
 
-  app.post("/mcp", express.json({ limit: "64mb" }), bearer, async (req: Request, res: Response) => {
+  app.post("/mcp", bearer, express.json({ limit: "64mb" }), async (req: Request, res: Response) => {
     const auth = (req as Request & { auth?: AuthInfo }).auth!;
     if (auth.resource && auth.resource.href !== mcpUrl.href) {
       res.status(401).json({ error: "invalid_token", error_description: "token was issued for a different resource" });

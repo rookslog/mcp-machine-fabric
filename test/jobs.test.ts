@@ -1,9 +1,9 @@
 import { constants } from "node:fs";
-import { access, mkdtemp, mkdir, rm, stat } from "node:fs/promises";
+import { access, appendFile, mkdtemp, mkdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
-import { JobManager, type JobRecord } from "../src/agent/jobs.js";
+import { JobManager, type JobManagerTestHooks, type JobRecord } from "../src/agent/jobs.js";
 
 const roots = new Set<string>();
 const groups = new Set<number>();
@@ -14,7 +14,7 @@ async function tempRoot(prefix = "mmf-jobs-"): Promise<string> {
   return root;
 }
 
-async function manager(root: string, options: { loginShell?: boolean } = {}): Promise<JobManager> {
+async function manager(root: string, options: { loginShell?: boolean; testHooks?: JobManagerTestHooks } = {}): Promise<JobManager> {
   const jobs = new JobManager({ stateDir: path.join(root, "state"), ...options });
   await jobs.init();
   return jobs;
@@ -173,6 +173,81 @@ describe("JobManager", () => {
     });
   });
 
+  test("re-reads an exit marker published after the initial status read before declaring lost", async () => {
+    const root = await tempRoot();
+    let publishExit = false;
+    const jobs = await manager(root, {
+      testHooks: {
+        beforeOwnershipProbe: async ({ jobDir, pid }) => {
+          if (!publishExit) return;
+          expect(pid).not.toBeNull();
+          const temporary = path.join(jobDir, `exit_code.tmp.${process.pid}`);
+          await writeFile(temporary, "23\n", { mode: 0o600 });
+          await rename(temporary, path.join(jobDir, "exit_code"));
+        },
+      },
+    });
+    const started = await jobs.start({ command: "sleep 300", cwd: root });
+    expect(started.pid).not.toBeNull();
+    groups.add(started.pid!);
+
+    process.kill(started.pid!, "SIGKILL");
+    await eventually(async () => processExists(started.pid!), (alive) => !alive);
+    publishExit = true;
+
+    expect(await jobs.get(started.job_id)).toMatchObject({ status: "exited", exit_code: 23 });
+  });
+
+  test("keeps the previous running status when ownership probing is inconclusive", async () => {
+    const root = await tempRoot();
+    let commandLineUnavailable = false;
+    const jobs = await manager(root, {
+      testHooks: {
+        commandLine: (pid, fallback) => (commandLineUnavailable ? Promise.resolve(null) : fallback()),
+      },
+    });
+    const started = await jobs.start({ command: "sleep 300", cwd: root });
+    expect(started).toMatchObject({ status: "running", pid: expect.any(Number) });
+    groups.add(started.pid!);
+
+    await writeFile(path.join(root, "state", started.job_id, "pid"), `${process.pid}\n`, { mode: 0o600 });
+    commandLineUnavailable = true;
+
+    expect((await jobs.get(started.job_id))?.status).toBe("running");
+  });
+
+  test("does not preserve a cached lost status when the next ownership probe is inconclusive", async () => {
+    const root = await tempRoot();
+    let commandLineUnavailable = false;
+    const jobs = await manager(root, {
+      testHooks: {
+        commandLine: (pid, fallback) => (commandLineUnavailable ? Promise.resolve(null) : fallback()),
+      },
+    });
+    const started = await jobs.start({ command: "sleep 300", cwd: root });
+    groups.add(started.pid!);
+
+    await writeFile(path.join(root, "state", started.job_id, "pid"), `${process.pid}\n`, { mode: 0o600 });
+    expect((await jobs.get(started.job_id))?.status).toBe("lost");
+
+    commandLineUnavailable = true;
+    expect((await jobs.get(started.job_id))?.status).toBe("running");
+  });
+
+  test("reconciles a cached lost job when an exit marker later appears", async () => {
+    const root = await tempRoot();
+    const jobs = await manager(root);
+    const started = await jobs.start({ command: "sleep 300", cwd: root });
+    groups.add(started.pid!);
+
+    process.kill(started.pid!, "SIGKILL");
+    await eventually(async () => processExists(started.pid!), (alive) => !alive);
+    expect((await jobs.get(started.job_id))?.status).toBe("lost");
+
+    await writeFile(path.join(root, "state", started.job_id, "exit_code"), "31\n", { mode: 0o600 });
+    expect(await jobs.get(started.job_id)).toMatchObject({ status: "exited", exit_code: 31 });
+  });
+
   test("cancel terminates the process group including grandchildren", async () => {
     const root = await tempRoot();
     const jobs = await manager(root);
@@ -287,5 +362,73 @@ describe("JobManager", () => {
     const started = await jobs.start({ command: "exit 0", cwd: root });
     await finished(jobs, started.job_id);
     expect(await jobs.cancel(started.job_id, 0)).toMatchObject({ status: "exited", exit_code: 0 });
+  });
+
+  test("prunes only old exited and killed job directories", async () => {
+    const root = await tempRoot();
+    const jobs = await manager(root);
+    const stateDir = path.join(root, "state");
+
+    const oldExited = await jobs.start({ command: "exit 0", cwd: root });
+    await finished(jobs, oldExited.job_id);
+    const oldKilled = await jobs.start({ command: "sleep 300", cwd: root });
+    groups.add(oldKilled.pid!);
+    expect((await jobs.cancel(oldKilled.job_id, 0)).status).toBe("killed");
+    const recentExited = await jobs.start({ command: "exit 0", cwd: root });
+    await finished(jobs, recentExited.job_id);
+    const running = await jobs.start({ command: "sleep 300", cwd: root });
+    groups.add(running.pid!);
+    const lost = await jobs.start({ command: "sleep 300", cwd: root });
+    groups.add(lost.pid!);
+    process.kill(lost.pid!, "SIGKILL");
+    await eventually(async () => processExists(lost.pid!), (alive) => !alive);
+    expect((await jobs.get(lost.job_id))?.status).toBe("lost");
+
+    const old = new Date(Date.now() - 60_000);
+    await utimes(path.join(stateDir, oldExited.job_id, "exit_code"), old, old);
+    await utimes(path.join(stateDir, oldKilled.job_id, "cancelled"), old, old);
+
+    expect(await jobs.prune(30_000)).toBe(2);
+    await expect(access(path.join(stateDir, oldExited.job_id))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(path.join(stateDir, oldKilled.job_id))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(path.join(stateDir, recentExited.job_id))).resolves.toBeUndefined();
+    await expect(access(path.join(stateDir, running.job_id))).resolves.toBeUndefined();
+    await expect(access(path.join(stateDir, lost.job_id))).resolves.toBeUndefined();
+    await expect(jobs.get(oldExited.job_id)).resolves.toBeNull();
+  });
+
+  test("read never pairs a finished status with a truncated tail", async () => {
+    const root = await tempRoot();
+    let probes = 0;
+    let armed = false;
+    const jobs = await manager(root, {
+      testHooks: {
+        // Finish the job (final output + exit marker) during the SECOND status
+        // derivation inside read(). If status were derived after the bytes are
+        // read, the result would say "exited" without the "tail" line.
+        beforeOwnershipProbe: async ({ jobDir, pid }) => {
+          if (!armed) return;
+          probes += 1;
+          if (probes === 2) {
+            await appendFile(path.join(jobDir, "output.log"), "tail\n");
+            await writeFile(path.join(jobDir, "exit_code"), "0\n");
+            try {
+              process.kill(-pid!, "SIGKILL");
+            } catch {}
+            await eventually(async () => processExists(pid!), (alive) => !alive);
+          }
+        },
+      },
+    });
+    const job = await jobs.start({ command: "echo head; sleep 30", cwd: root });
+    groups.add(job.pid!);
+    await eventually(async () => (await jobs.read(job.job_id)).output, (out) => out.includes("head"));
+    armed = true;
+    const r = await jobs.read(job.job_id, 0);
+    expect(probes).toBeGreaterThanOrEqual(2);
+    if (r.job.status === "exited") expect(r.output).toContain("tail");
+    const after = await jobs.read(job.job_id, 0);
+    expect(after.job.status).toBe("exited");
+    expect(after.output).toContain("tail");
   });
 });

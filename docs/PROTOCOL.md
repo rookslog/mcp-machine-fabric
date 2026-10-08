@@ -51,9 +51,27 @@ Rules:
    an explanation and, for commands, the `job_id` that is still running.
 4. **Hub restart.** On start the hub marks every `dispatched`/`accepted`
    request as `dispatched_unknown`, then recovers them as agents reconnect.
-5. **Idempotency keys** are scoped to (principal, machine, tool, key). A repeat
+5. **Attested non-receipt.** The agent records a call durably before acking or
+   executing it, and marks receipt in memory before its first `await`. So when
+   the owning agent answers `recover` with `unknown` for a call it never
+   acknowledged, the call provably never ran: the hub marks it
+   `not_dispatched` (`error_code: never_received`). An acknowledged call whose
+   record has since vanished (pruned after 24 h, state dir wiped) stays
+   `dispatched_unknown`. Each agent state directory has a persistent
+   `state_id`; the hub records which one a call was dispatched to and accepts
+   "never received" only from that same state directory, so two agents
+   sharing one device token cannot vouch for each other.
+6. **Idempotency keys** are scoped to (principal, machine, tool, key). A repeat
    returns the recorded outcome (`replayed: true`) or, if the first call is
-   still unresolved, its state — never a second execution.
+   still unresolved, its state — never a second execution. A request that ended
+   `not_dispatched` releases its key, so retrying with the same key dispatches
+   a fresh request (the earlier row stays in the audit trail).
+
+These rules are exercised by `test/chaos.test.ts`: a seeded workload of 60
+keyed mutations across two agents with hub restarts, agent restarts, dropped
+connections and a full outage, asserting no duplicate side effects, outcomes
+that match side effects, nothing reported `not_dispatched` having run, and every
+request terminal after recovery (`CHAOS_SEED=<n>` reproduces a schedule).
 
 ## Durable jobs
 

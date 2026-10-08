@@ -39,7 +39,7 @@ test(
   async () => {
     const emptyCache = await mkdtemp(nodePath.join(tmpdir(), "mmf-empty-npm-cache-"));
     try {
-      const output = await expectSmokeFailure({ ...process.env, npm_config_cache: emptyCache });
+      const output = await expectSmokeFailure({ ...process.env, npm_config_cache: emptyCache, MMF_PACK_SMOKE_NETWORK: "" });
       expect(output).toMatch(/ENOTCACHED|cache miss|offline mode/i);
       expect(output).not.toContain("PACK_SMOKE_OK");
     } finally {
@@ -112,9 +112,11 @@ test(
         MMF_PACK_SMOKE_WAIT_SECONDS: "0.1",
       });
       expect(output).not.toContain("PACK_SMOKE_OK");
-      sleepPid = Number((await readFile(pidFile, "utf8")).trim());
-      expect(sleepPid).toBeGreaterThan(0);
-      expect(() => process.kill(sleepPid, 0)).toThrow();
+      // If the cancel landed before the shell reached `sleep &`, no pid file
+      // exists and nothing can have leaked; otherwise the sleeper must be dead.
+      const pidText = await readFile(pidFile, "utf8").catch(() => "");
+      sleepPid = Number(pidText.trim());
+      if (sleepPid > 0) expect(() => process.kill(sleepPid, 0)).toThrow();
     } finally {
       if (sleepPid > 0) {
         try {

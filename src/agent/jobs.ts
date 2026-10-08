@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import {
@@ -7,6 +7,7 @@ import {
   open,
   readFile,
   readdir,
+  rm,
   stat,
   writeFile,
 } from "node:fs/promises";
@@ -82,6 +83,13 @@ export interface JobManagerOptions {
   shell?: string;
   /** Use a login shell (-lc) so PATH matches an interactive session. Default true. */
   loginShell?: boolean;
+  /** @internal Deterministic seams for status-race regression tests. */
+  testHooks?: JobManagerTestHooks;
+}
+
+export interface JobManagerTestHooks {
+  beforeOwnershipProbe?: (context: { jobId: string; jobDir: string; pid: number | null }) => Promise<void> | void;
+  commandLine?: (pid: number, fallback: () => Promise<string | null>) => Promise<string | null>;
 }
 
 interface JobMeta {
@@ -168,7 +176,8 @@ function processGroupExists(pid: number): boolean {
     process.kill(-pid, 0);
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    // EPERM: either a member we may not signal, or (macOS) only zombies remain.
+    return (error as NodeJS.ErrnoException).code === "EPERM" && groupHasLiveMember(pid);
   }
 }
 
@@ -183,7 +192,9 @@ async function commandLine(pid: number): Promise<string | null> {
 
   if (platform() === "darwin") {
     try {
-      const { stdout } = await execFileAsync("ps", ["-o", "command=", "-p", String(pid)], { encoding: "utf8" });
+      const { stdout } = await execFileAsync("ps", ["-ww", "-o", "command=", "-p", String(pid)], {
+        encoding: "utf8",
+      });
       return stdout;
     } catch {
       return null;
@@ -193,10 +204,17 @@ async function commandLine(pid: number): Promise<string | null> {
   return null;
 }
 
-async function isOwnedWrapper(pid: number, jobDir: string): Promise<boolean> {
-  if (!processExists(pid)) return false;
-  const line = await commandLine(pid);
-  return line !== null && line.includes(jobDir);
+type Ownership = "owned" | "not-owned" | "unknown";
+
+async function probeWrapperOwnership(
+  pid: number,
+  jobDir: string,
+  readCommandLine: (pid: number) => Promise<string | null> = commandLine,
+): Promise<Ownership> {
+  if (!processExists(pid)) return "not-owned";
+  const line = await readCommandLine(pid);
+  if (line !== null) return line.includes(jobDir) ? "owned" : "not-owned";
+  return processExists(pid) ? "unknown" : "not-owned";
 }
 
 function nextJobId(): { id: string; createdAt: string } {
@@ -212,7 +230,25 @@ function sendSignal(target: number, signal: NodeJS.Signals): void {
   try {
     process.kill(target, signal);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return;
+    // macOS returns EPERM for kill(-pgid) when every remaining member of the
+    // group is a zombie (already dying). That group is gone for our purposes;
+    // a genuine permission problem shows up on a live member below.
+    if (code === "EPERM" && target < 0 && !groupHasLiveMember(-target)) return;
+    throw error;
+  }
+}
+
+function groupHasLiveMember(pgid: number): boolean {
+  try {
+    const out = execFileSync("ps", ["-A", "-o", "pgid=,stat="], { encoding: "utf8", timeout: 5000 });
+    return out.split("\n").some((line) => {
+      const [g, stat] = line.trim().split(/\s+/);
+      return Number(g) === pgid && !!stat && !stat.startsWith("Z");
+    });
+  } catch {
+    return true; // inconclusive: keep the original error
   }
 }
 
@@ -220,12 +256,14 @@ export class JobManager {
   readonly #stateDir: string;
   readonly #shell: string;
   readonly #loginShell: boolean;
+  readonly #testHooks: JobManagerTestHooks | undefined;
   readonly #cache = new Map<string, JobRecord>();
 
   constructor(opts: JobManagerOptions) {
     this.#stateDir = path.resolve(opts.stateDir);
     this.#shell = opts.shell ?? process.env.SHELL ?? (platform() === "darwin" ? "/bin/zsh" : "/bin/bash");
     this.#loginShell = opts.loginShell ?? true;
+    this.#testHooks = opts.testHooks;
   }
 
   /** Create stateDir (0700) and reconcile any jobs from a previous agent run. */
@@ -332,6 +370,26 @@ export class JobManager {
     return filter.limit === undefined ? selected : selected.slice(0, filter.limit);
   }
 
+  /** Delete exited or killed job directories whose terminal marker is older than the threshold. */
+  async prune(olderThanMs: number): Promise<number> {
+    if (!Number.isFinite(olderThanMs) || olderThanMs < 0) throw new Error("olderThanMs must be non-negative");
+    const cutoff = Date.now() - olderThanMs;
+    let removed = 0;
+
+    for (const entry of await readdir(this.#stateDir, { withFileTypes: true })) {
+      if (!entry.isDirectory() || !JOB_ID_PATTERN.test(entry.name)) continue;
+      const record = await this.get(entry.name);
+      if (!record || (record.status !== "exited" && record.status !== "killed") || record.ended_at === null) continue;
+      const endedAt = Date.parse(record.ended_at);
+      if (!Number.isFinite(endedAt) || endedAt >= cutoff) continue;
+      await rm(this.#jobDir(entry.name), { recursive: true, force: true });
+      this.#cache.delete(entry.name);
+      removed += 1;
+    }
+
+    return removed;
+  }
+
   /** Read output from byte cursor; if waitMs>0, wait until new output or exit (or timeout). */
   async read(jobId: string, cursor = 0, maxBytes = DEFAULT_MAX_BYTES, waitMs = 0): Promise<JobReadResult> {
     assertJobId(jobId);
@@ -350,6 +408,11 @@ export class JobManager {
       size = await this.#outputSize(jobId);
     }
 
+    // Snapshot status BEFORE reading bytes: if the job had already finished,
+    // its output file is complete, so "exited" is never paired with a
+    // truncated tail. (Deriving status after the read could report exited
+    // while missing output written between the two steps.)
+    job = await this.#require(jobId);
     const outputFile = await open(path.join(this.#jobDir(jobId), "output.log"), "r");
     let bytes: Buffer;
     try {
@@ -377,7 +440,6 @@ export class JobManager {
       }
     }
 
-    job = await this.#require(jobId);
     const nextCursor = cursor + end;
     return { job, output, next_cursor: nextCursor, more_available: nextCursor < size };
   }
@@ -418,7 +480,7 @@ export class JobManager {
     const jobDir = this.#jobDir(jobId);
     await writeFile(path.join(jobDir, "cancelled"), `${new Date().toISOString()}\n`, { mode: 0o600 });
     const pid = record.pid;
-    if (pid !== null && (await isOwnedWrapper(pid, jobDir))) {
+    if (pid !== null && (await this.#probeOwnership(pid, jobDir)) === "owned") {
       sendSignal(-pid, "SIGTERM");
       const deadline = Date.now() + graceMs;
       while (processGroupExists(pid) && Date.now() < deadline) await delay(POLL_MS);
@@ -444,6 +506,11 @@ export class JobManager {
     return path.join(this.#stateDir, jobId);
   }
 
+  #probeOwnership(pid: number, jobDir: string): Promise<Ownership> {
+    const hook = this.#testHooks?.commandLine;
+    return probeWrapperOwnership(pid, jobDir, hook ? (target) => hook(target, () => commandLine(target)) : commandLine);
+  }
+
   async #require(jobId: string): Promise<JobRecord> {
     const record = await this.get(jobId);
     if (!record) throw new Error(`job ${jobId} not found`);
@@ -461,23 +528,40 @@ export class JobManager {
 
   async #record(jobId: string, meta: JobMeta): Promise<JobRecord> {
     const jobDir = this.#jobDir(jobId);
+    const previous = this.#cache.get(jobId);
     const pid = parsePid(await readOptional(path.join(jobDir, "pid")));
-    const exitText = await readOptional(path.join(jobDir, "exit_code"));
-    const cancelled = await readOptional(path.join(jobDir, "cancelled"));
+    const exitPath = path.join(jobDir, "exit_code");
+    const cancelledPath = path.join(jobDir, "cancelled");
+    let exitText = await readOptional(exitPath);
+    let cancelled = await readOptional(cancelledPath);
     let status: JobStatus;
     let exitCode: number | null = null;
     let endedAt: string | null = null;
+
+    if (exitText === null) await this.#testHooks?.beforeOwnershipProbe?.({ jobId, jobDir, pid });
+    const ownership: Ownership = exitText === null && pid !== null ? await this.#probeOwnership(pid, jobDir) : "not-owned";
+    if (exitText === null && ownership !== "owned") {
+      // Ownership checks are slower than file reads (and invoke ps on macOS).
+      // The wrapper can publish exit_code and disappear between those two
+      // observations, so refresh terminal markers before declaring it lost.
+      exitText = await readOptional(exitPath);
+      cancelled = await readOptional(cancelledPath);
+    }
 
     if (exitText !== null) {
       const parsed = Number.parseInt(exitText.trim(), 10);
       exitCode = Number.isSafeInteger(parsed) ? parsed : null;
       status = "exited";
-      endedAt = (await stat(path.join(jobDir, "exit_code"))).mtime.toISOString();
-    } else if (pid !== null && (await isOwnedWrapper(pid, jobDir))) {
+      endedAt = (await stat(exitPath)).mtime.toISOString();
+    } else if (ownership === "owned") {
       status = "running";
+    } else if (ownership === "unknown") {
+      status = previous?.status === undefined || previous.status === "lost" ? "running" : previous.status;
+      exitCode = previous?.exit_code ?? null;
+      endedAt = previous?.ended_at ?? null;
     } else if (cancelled !== null) {
       status = "killed";
-      endedAt = (await stat(path.join(jobDir, "cancelled"))).mtime.toISOString();
+      endedAt = (await stat(cancelledPath)).mtime.toISOString();
     } else {
       status = "lost";
       const pidStat = await stat(path.join(jobDir, "pid")).catch(() => null);

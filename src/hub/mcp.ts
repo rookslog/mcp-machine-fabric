@@ -273,7 +273,9 @@ function registerAgentTool(server: McpServer, ctx: McpContext, caller: CallerInf
       const key = typeof idempotency_key === "string" ? idempotency_key : null;
       if (key) {
         const prev = ctx.store.findIdempotent(caller.principal, machine, spec.name, key);
-        if (prev) return replay(prev);
+        // A request that provably never ran does not hold its key: retry dispatches fresh.
+        if (prev && prev.state === "not_dispatched") ctx.store.releaseIdempotencyKey(prev.request_id);
+        else if (prev) return replay(prev);
       }
 
       try {

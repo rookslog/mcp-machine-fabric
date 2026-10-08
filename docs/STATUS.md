@@ -34,8 +34,10 @@ DIONYSUS, GitHub Actions ubuntu/macOS): durable jobs, file tools and policy,
 OAuth server, OAuth end-to-end through the real hub with the SDK's OAuth
 client, installers (also under stock macOS bash 3.2), OpenAI-tunnel setup
 (dry-run), npm tarball smoke, and a hub+agent end-to-end suite (real HTTP, real
-WebSockets, real processes, MCP SDK client). 102 passed / 1 skipped locally at
-the time of writing.
+WebSockets, real processes, MCP SDK client). 112 passed / 1 skipped locally;
+GitHub Actions green on ubuntu + macOS × Node 22 + 24 plus gitleaks (run
+37803461055, commit 75892b6). Deployed release: `0.1.0-75892b6` on both
+machines, live check 20/20 after deploy.
 
 Live, on the deployed services (2026-10-08, from Apollo unless noted):
 
@@ -50,7 +52,14 @@ Live, on the deployed services (2026-10-08, from Apollo unless noted):
 | Docker image (hub) | built and smoke-tested on DIONYSUS by a worker: health, enrollment, host agent READY, `run_command` through the container; cleaned up | packaging slice report |
 | Warm command latency through the hub | ~0.1 s DIONYSUS, ~0.33 s Apollo; first command after the Apollo agent started took 7.9 s (cold; cause unchecked) | probe timings |
 
-Bugs found by tests/reviews and fixed during the build: OAuth
+Bugs found by tests/reviews and fixed during the build: a cross-vendor
+review (Codex) found that a stale `recovered: running` frame could reopen a
+finished request, that any enrolled agent could finalize another machine's
+request, that malformed agent frames were dereferenced unchecked, that `/mcp`
+parsed bodies before auth, and an uncapped negative `limit` — all fixed with
+regression tests (`test/review-findings.test.ts`). On macOS a zombie-only
+process group answers `kill(-pgid)` with EPERM, which made `cancel_job` throw —
+fixed. OAuth
 `verifyAccessToken` reported the hub URL instead of the token's stored
 resource (a token minted for another resource was accepted); revoked devices
 stayed connected until reconnect; `read_file` had no response-size cap;
@@ -62,9 +71,18 @@ installer arrays broke under bash 3.2.
   verified with the SDK client over public HTTPS, but creating the ChatGPT app
   is an owner UI step and needs either an OpenAI tunnel ID (preferred, see
   [CHATGPT.md](CHATGPT.md)) or Tailscale Funnel enabled for the node.
-- `test/jobs.test.ts` was intermittently flaky on macOS under load (`lost`
-  instead of `exited`): root causes identified (status-derivation race; `ps`
-  errors treated as "not ours"); fix tracked separately until merged.
+- Job status flakiness on macOS (`lost` instead of `exited`) had two real
+  causes (status-derivation race; `ps` errors treated as "not ours"), both fixed
+  with deterministic tests; 8/8 jobs runs passed under concurrent full-suite
+  load afterwards.
+- An independent Claude security review of the auth surface found two HIGH
+  issues (any authenticated token, even with no scopes, could read other
+  principals' command output via the audit tools/API; the consent page could
+  issue a zero-scope token) plus consent-lockout DoS, an `/authorize` open
+  redirect, and phishing-friendly defaults. **Fixes are in progress on a branch
+  at the time of writing** — check `git log` for "security" before relying on
+  multi-client separation. Single-owner deployments with only your own tokens
+  are not exposed to another principal by these.
 - Hub is a single process with SQLite; no HA. Restart recovery is tested.
 - ChatGPT's own tool-call timeout is unknown; `run_command` waits 30 s by
   default and hands back a `job_id` for anything longer.

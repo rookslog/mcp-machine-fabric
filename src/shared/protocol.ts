@@ -57,6 +57,13 @@ export interface AgentInfo {
   policy: { read_only: boolean; roots: string[]; allow_exec: boolean };
   /** Agent wall-clock start (ISO), used to detect agent restarts. */
   started_at: string;
+  /**
+   * Stable id of the agent's state directory (persisted there). Recovery
+   * answers are only trusted from the same state directory the call was
+   * dispatched to: two agents sharing one token but not one state dir cannot
+   * vouch for each other.
+   */
+  state_id?: string;
 }
 
 export type AgentToHub =
@@ -85,12 +92,38 @@ export interface ExecutorHealth {
   loop_lag_ms: number;
 }
 
+const isStr = (v: unknown): v is string => typeof v === "string" && v.length > 0;
+const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
+const isOutcome = (v: unknown): boolean =>
+  isObj(v) && (v.ok === true ? typeof v.text === "string" : v.ok === false && isStr(v.code) && typeof v.message === "string");
+
+/** Required-field validators per frame type. Frames that fail are dropped, never dereferenced. */
+const FRAME_VALIDATORS: Record<string, (f: Record<string, unknown>) => boolean> = {
+  // agent -> hub
+  hello: (f) => isObj(f.info) && Array.isArray(f.info.tools) && isObj(f.info.policy) && isStr(f.info.agent_version),
+  accepted: (f) => isStr(f.request_id),
+  result: (f) => isStr(f.request_id) && isOutcome(f.outcome) && typeof f.duration_ms === "number",
+  recovered: (f) =>
+    isStr(f.request_id) &&
+    ["completed", "failed", "running", "unknown"].includes(f.state as string) &&
+    (f.outcome === undefined || isOutcome(f.outcome)),
+  health: (f) => isObj(f.executor) && typeof f.executor.active_calls === "number" && typeof f.executor.capacity === "number",
+  pong: (f) => isStr(f.nonce),
+  // hub -> agent
+  welcome: (f) => isStr(f.machine),
+  call: (f) => isStr(f.request_id) && isStr(f.tool) && isObj(f.args) && typeof f.deadline_ms === "number",
+  recover: (f) => Array.isArray(f.request_ids) && f.request_ids.every(isStr),
+  ping: (f) => isStr(f.nonce),
+  error: (f) => typeof f.code === "string" && typeof f.message === "string",
+};
+
 export function parseFrame<T>(raw: unknown): T | null {
   try {
     const text = typeof raw === "string" ? raw : Buffer.isBuffer(raw) ? raw.toString("utf8") : String(raw);
     const v = JSON.parse(text);
-    if (v && typeof v === "object" && typeof v.type === "string") return v as T;
-    return null;
+    if (!isObj(v) || typeof v.type !== "string") return null;
+    const validate = FRAME_VALIDATORS[v.type];
+    return validate && validate(v) ? (v as T) : null;
   } catch {
     return null;
   }
