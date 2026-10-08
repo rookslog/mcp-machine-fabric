@@ -35,7 +35,7 @@ OAuth server, OAuth end-to-end through the real hub with the SDK's OAuth
 client, installers (also under stock macOS bash 3.2), OpenAI-tunnel setup
 (dry-run), npm tarball smoke, and a hub+agent end-to-end suite (real HTTP, real
 WebSockets, real processes, MCP SDK client), a seeded chaos suite for the
-delivery guarantees, and security regressions. 140 passed / 1 skipped locally
+delivery guarantees (20 seeds, all invariants held), delivery edge cases, and security regressions. 144 passed / 1 skipped locally at 2acdf53 (CI green, run 37808028366); 140 passed / 1 skipped locally
 (macOS) at commit e8d3821; GitHub Actions green on ubuntu + macOS × Node 22 +
 24 plus gitleaks for that commit. Deployed release: `0.1.0-e8d3821` on both
 machines; live check 20/20 after deploy; `mmf doctor` passes on both hosts
