@@ -145,7 +145,14 @@ export class Registry {
     this.conns.set(machine, conn);
     this.store.touchDevice(deviceId);
 
-    ws.on("message", (raw) => this.onMessage(conn, raw));
+    ws.on("message", (raw) => {
+      try {
+        this.onMessage(conn, raw);
+      } catch (err) {
+        // A misbehaving agent must not take the hub down.
+        this.log("error handling agent frame", { machine, error: String(err) });
+      }
+    });
     ws.on("close", () => {
       if (this.conns.get(machine) === conn) this.conns.delete(machine);
       this.detach(conn, "agent connection closed");
@@ -183,7 +190,7 @@ export class Registry {
         conn.executor = msg.executor;
         break;
       case "accepted": {
-        const p = conn.pending.get(msg.request_id);
+        const p = conn.pending.get(msg.request_id); // pending is per-connection, so only this machine's calls match
         if (p) {
           p.accepted = true;
           this.store.setState(msg.request_id, "accepted");
@@ -199,15 +206,19 @@ export class Registry {
         } else {
           // Late result for a call the hub already gave up on: record it so
           // get_request_status can report the true outcome.
-          this.recordLate(msg.request_id, msg.outcome);
+          this.recordLate(conn, msg.request_id, msg.outcome);
         }
         break;
       }
       case "recovered": {
         if ((msg.state === "completed" || msg.state === "failed") && msg.outcome) {
-          this.recordLate(msg.request_id, msg.outcome);
+          this.recordLate(conn, msg.request_id, msg.outcome);
         } else if (msg.state === "running") {
-          this.store.setState(msg.request_id, "accepted");
+          const row = this.store.getRequest(msg.request_id);
+          // Only an unresolved request of this machine may move back to accepted.
+          if (row && row.machine === conn.machine && (row.state === "dispatched" || row.state === "dispatched_unknown")) {
+            this.store.setState(msg.request_id, "accepted");
+          }
         }
         // "unknown": leave as dispatched_unknown — truthfully unknown.
         break;
@@ -215,9 +226,13 @@ export class Registry {
     }
   }
 
-  private recordLate(requestId: string, outcome: ToolOutcome): void {
+  private recordLate(conn: AgentConnection, requestId: string, outcome: ToolOutcome): void {
     const row = this.store.getRequest(requestId);
-    if (!row || row.state === "completed" || row.state === "failed") return;
+    if (!row || row.state === "completed" || row.state === "failed" || row.state === "not_dispatched") return;
+    if (row.machine !== conn.machine) {
+      this.log("ignored result for another machine's request", { machine: conn.machine, request_id: requestId });
+      return;
+    }
     this.store.finish(requestId, outcome, row.idempotency_key !== null);
     this.log("recorded late/recovered result", { request_id: requestId, ok: outcome.ok });
   }
