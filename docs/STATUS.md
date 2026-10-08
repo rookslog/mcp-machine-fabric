@@ -34,10 +34,12 @@ DIONYSUS, GitHub Actions ubuntu/macOS): durable jobs, file tools and policy,
 OAuth server, OAuth end-to-end through the real hub with the SDK's OAuth
 client, installers (also under stock macOS bash 3.2), OpenAI-tunnel setup
 (dry-run), npm tarball smoke, and a hub+agent end-to-end suite (real HTTP, real
-WebSockets, real processes, MCP SDK client). 112 passed / 1 skipped locally;
-GitHub Actions green on ubuntu + macOS × Node 22 + 24 plus gitleaks (run
-37803461055, commit 75892b6). Deployed release: `0.1.0-75892b6` on both
-machines, live check 20/20 after deploy.
+WebSockets, real processes, MCP SDK client), a seeded chaos suite for the
+delivery guarantees, and security regressions. 140 passed / 1 skipped locally
+(macOS) at commit e8d3821; GitHub Actions green on ubuntu + macOS × Node 22 +
+24 plus gitleaks for that commit. Deployed release: `0.1.0-e8d3821` on both
+machines; live check 20/20 after deploy; `mmf doctor` passes on both hosts
+(one expected WARN on Apollo: plain `ws://` over the tailnet).
 
 Live, on the deployed services (2026-10-08, from Apollo unless noted):
 
@@ -76,13 +78,14 @@ installer arrays broke under bash 3.2.
   with deterministic tests; 8/8 jobs runs passed under concurrent full-suite
   load afterwards.
 - An independent Claude security review of the auth surface found two HIGH
-  issues (any authenticated token, even with no scopes, could read other
-  principals' command output via the audit tools/API; the consent page could
-  issue a zero-scope token) plus consent-lockout DoS, an `/authorize` open
-  redirect, and phishing-friendly defaults. **Fixes are in progress on a branch
-  at the time of writing** — check `git log` for "security" before relying on
-  multi-client separation. Single-owner deployments with only your own tokens
-  are not exposed to another principal by these.
+  issues (any authenticated token could read other principals' command output
+  via the audit tools/API; the consent page could issue a zero-scope token)
+  plus a consent-lockout DoS, an `/authorize` open redirect, phishing-friendly
+  consent defaults and unbounded OAuth storage. All fixed with regression tests
+  (`test/security-regressions.test.ts`), together with machine-scoped grants
+  (`machine:<name>` scopes on the consent page and `mmf token create
+  --machines`). The fixes were reviewed by the implementing worker's own
+  reviewer, not re-reviewed by the original reviewer.
 - Hub is a single process with SQLite; no HA. Restart recovery is tested.
 - ChatGPT's own tool-call timeout is unknown; `run_command` waits 30 s by
   default and hands back a `job_id` for anything longer.
