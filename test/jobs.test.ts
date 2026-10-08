@@ -1,5 +1,5 @@
 import { constants } from "node:fs";
-import { access, mkdtemp, mkdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { access, appendFile, mkdtemp, mkdir, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -395,5 +395,40 @@ describe("JobManager", () => {
     await expect(access(path.join(stateDir, running.job_id))).resolves.toBeUndefined();
     await expect(access(path.join(stateDir, lost.job_id))).resolves.toBeUndefined();
     await expect(jobs.get(oldExited.job_id)).resolves.toBeNull();
+  });
+
+  test("read never pairs a finished status with a truncated tail", async () => {
+    const root = await tempRoot();
+    let probes = 0;
+    let armed = false;
+    const jobs = await manager(root, {
+      testHooks: {
+        // Finish the job (final output + exit marker) during the SECOND status
+        // derivation inside read(). If status were derived after the bytes are
+        // read, the result would say "exited" without the "tail" line.
+        beforeOwnershipProbe: async ({ jobDir, pid }) => {
+          if (!armed) return;
+          probes += 1;
+          if (probes === 2) {
+            await appendFile(path.join(jobDir, "output.log"), "tail\n");
+            await writeFile(path.join(jobDir, "exit_code"), "0\n");
+            try {
+              process.kill(-pid!, "SIGKILL");
+            } catch {}
+            await eventually(async () => processExists(pid!), (alive) => !alive);
+          }
+        },
+      },
+    });
+    const job = await jobs.start({ command: "echo head; sleep 30", cwd: root });
+    groups.add(job.pid!);
+    await eventually(async () => (await jobs.read(job.job_id)).output, (out) => out.includes("head"));
+    armed = true;
+    const r = await jobs.read(job.job_id, 0);
+    expect(probes).toBeGreaterThanOrEqual(2);
+    if (r.job.status === "exited") expect(r.output).toContain("tail");
+    const after = await jobs.read(job.job_id, 0);
+    expect(after.job.status).toBe("exited");
+    expect(after.output).toContain("tail");
   });
 });

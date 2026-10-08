@@ -220,7 +220,18 @@ export class Registry {
             this.store.setState(msg.request_id, "accepted");
           }
         }
-        // "unknown": leave as dispatched_unknown — truthfully unknown.
+        else if (msg.state === "unknown") {
+          // The agent records every call durably before acknowledging or
+          // executing it, and guards in-flight receipt in memory, so "unknown"
+          // from the owning machine attests the call never ran. Only requests
+          // that were never acknowledged qualify; an acknowledged call whose
+          // record is gone (pruned/wiped) stays truthfully unknown.
+          const row = this.store.getRequest(msg.request_id);
+          if (row && row.machine === conn.machine && (row.state === "dispatched" || row.state === "dispatched_unknown")) {
+            this.store.markNeverReceived(msg.request_id);
+            this.log("request never reached the agent; marked not_dispatched", { request_id: msg.request_id });
+          }
+        }
         break;
       }
     }

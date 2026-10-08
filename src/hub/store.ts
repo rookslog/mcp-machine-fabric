@@ -205,6 +205,21 @@ export class HubStore {
       );
   }
 
+  /** Terminal "never ran": the agent attested it has no record of the call. */
+  markNeverReceived(requestId: string): void {
+    const now = Date.now();
+    this.db
+      .prepare(
+        "UPDATE requests SET state = 'not_dispatched', error_code = 'never_received', updated_at = ?, finished_at = ? WHERE request_id = ?",
+      )
+      .run(now, now, requestId);
+  }
+
+  /** Free an idempotency key held by a request that never ran, so a retry can dispatch fresh. */
+  releaseIdempotencyKey(requestId: string): void {
+    this.db.prepare("UPDATE requests SET idempotency_key = NULL WHERE request_id = ? AND state = 'not_dispatched'").run(requestId);
+  }
+
   getRequest(requestId: string): RequestRow | null {
     return (this.db.prepare("SELECT * FROM requests WHERE request_id = ?").get(requestId) as RequestRow | undefined) ?? null;
   }

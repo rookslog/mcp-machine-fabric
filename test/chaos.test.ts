@@ -734,8 +734,11 @@ test(
           }
         }
         const seen = observation(mutation.key);
+        // A request that provably never ran (not_dispatched) releases its key,
+        // so a retry legitimately runs under a new request id. Any other
+        // returned id must be the keyed row itself.
         const mismatchedIds = [...seen.requestIds].filter(
-          (requestId) => requestId !== row.request_id,
+          (requestId) => requestId !== row.request_id && h.store.getRequest(requestId)?.state !== "not_dispatched",
         );
         if (mismatchedIds.length > 0) {
           harnessFailures.push(
@@ -746,7 +749,9 @@ test(
               row.request_id,
           );
         }
-        if (row.state === "not_dispatched" || seen.toldNotDispatched) {
+        // Judge "not_dispatched produced nothing" on the key's final row: an
+        // earlier not_dispatched attempt may be followed by a successful retry.
+        if (row.state === "not_dispatched") {
           if (lines.length !== 0) {
             invariantFailures.not_dispatched_has_no_side_effect.push(
               mutation.key + " was reported not_dispatched but produced " + JSON.stringify(lines),

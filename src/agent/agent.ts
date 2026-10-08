@@ -181,6 +181,8 @@ export class Agent {
   private loopLag = 0;
   readonly startedAt = new Date().toISOString();
   machine: string | null = null;
+  /** Request ids received by this process and not yet finished (set synchronously on receipt). */
+  private received = new Set<string>();
   private connectedResolvers: Array<() => void> = [];
 
   constructor(private opts: AgentOptions) {
@@ -301,7 +303,14 @@ export class Agent {
         this.send({ type: "pong", nonce: msg.nonce });
         break;
       case "call":
-        await this.handleCall(msg.request_id, msg.tool, msg.args);
+        // Mark receipt before any await so a concurrent `recover` can never
+        // report "unknown" for a call this process is about to execute.
+        this.received.add(msg.request_id);
+        try {
+          await this.handleCall(msg.request_id, msg.tool, msg.args);
+        } finally {
+          this.received.delete(msg.request_id);
+        }
         break;
       case "recover":
         for (const id of msg.request_ids) await this.handleRecover(id);
@@ -337,8 +346,14 @@ export class Agent {
   }
 
   private async handleRecover(requestId: string): Promise<void> {
+    if (this.received.has(requestId)) {
+      this.send({ type: "recovered", request_id: requestId, state: "running" });
+      return;
+    }
     const rec = await this.cache.get(requestId);
     if (!rec) {
+      // Attested: this agent never durably recorded the call, and it records
+      // before executing anything, so the call never ran here.
       this.send({ type: "recovered", request_id: requestId, state: "unknown" });
     } else if (rec.state === "running" && !this.cache.isOrphaned(rec)) {
       this.send({ type: "recovered", request_id: requestId, state: "running" });

@@ -408,6 +408,11 @@ export class JobManager {
       size = await this.#outputSize(jobId);
     }
 
+    // Snapshot status BEFORE reading bytes: if the job had already finished,
+    // its output file is complete, so "exited" is never paired with a
+    // truncated tail. (Deriving status after the read could report exited
+    // while missing output written between the two steps.)
+    job = await this.#require(jobId);
     const outputFile = await open(path.join(this.#jobDir(jobId), "output.log"), "r");
     let bytes: Buffer;
     try {
@@ -435,7 +440,6 @@ export class JobManager {
       }
     }
 
-    job = await this.#require(jobId);
     const nextCursor = cursor + end;
     return { job, output, next_cursor: nextCursor, more_available: nextCursor < size };
   }
