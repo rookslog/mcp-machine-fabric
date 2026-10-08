@@ -1,4 +1,4 @@
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import {
@@ -176,7 +176,8 @@ function processGroupExists(pid: number): boolean {
     process.kill(-pid, 0);
     return true;
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+    // EPERM: either a member we may not signal, or (macOS) only zombies remain.
+    return (error as NodeJS.ErrnoException).code === "EPERM" && groupHasLiveMember(pid);
   }
 }
 
@@ -229,7 +230,25 @@ function sendSignal(target: number, signal: NodeJS.Signals): void {
   try {
     process.kill(target, signal);
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error;
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ESRCH") return;
+    // macOS returns EPERM for kill(-pgid) when every remaining member of the
+    // group is a zombie (already dying). That group is gone for our purposes;
+    // a genuine permission problem shows up on a live member below.
+    if (code === "EPERM" && target < 0 && !groupHasLiveMember(-target)) return;
+    throw error;
+  }
+}
+
+function groupHasLiveMember(pgid: number): boolean {
+  try {
+    const out = execFileSync("ps", ["-A", "-o", "pgid=,stat="], { encoding: "utf8", timeout: 5000 });
+    return out.split("\n").some((line) => {
+      const [g, stat] = line.trim().split(/\s+/);
+      return Number(g) === pgid && !!stat && !stat.startsWith("Z");
+    });
+  } catch {
+    return true; // inconclusive: keep the original error
   }
 }
 
