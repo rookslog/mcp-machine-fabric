@@ -6,10 +6,10 @@ Status as of 2026-10-08: the OpenAI tunnel route is prepared and dry-run tested.
 
 | Route | Hub exposure | ChatGPT authentication | Use when |
 |---|---|---|---|
-| A. OpenAI Secure MCP Tunnel | No public inbound listener; tunnel-client makes outbound connections | **No authentication** in ChatGPT; tunnel-client injects a local MMF PAT | Preferred for this host |
+| A. OpenAI Secure MCP Tunnel | No public inbound listener; tunnel-client makes outbound connections | **No authentication** in ChatGPT; tunnel-client injects a local MMF PAT | Prefer when the hub should remain private |
 | B. Tailscale Funnel | Public HTTPS endpoint on port 8443 | Hub OAuth with owner consent | Use only when a public endpoint is acceptable |
 
-Route A is preferred. `tunnel-client` 0.0.9 supports `mcp.extra_headers` and `mcp.discovery_extra_headers`, including `file:` secret references. The setup script stores the raw PAT separately from the complete `Bearer …` header value and references the latter from the profile. The connector must use **No authentication**: tunnel-client applies connector-supplied headers after static headers, so a forwarded `Authorization` header would override the injected PAT.
+Route A is preferred when the hub should remain private. `tunnel-client` 0.0.9 supports `mcp.extra_headers` and `mcp.discovery_extra_headers`, including `file:` secret references. The setup script stores the raw PAT separately from the complete `Bearer …` header value and references the latter from the profile. The connector must use **No authentication**: tunnel-client applies connector-supplied headers after static headers, so a forwarded `Authorization` header would override the injected PAT.
 
 The tunnel runtime's `CONTROL_PLANE_API_KEY` authenticates tunnel-client to OpenAI. It does not authenticate requests to the MMF hub. An `OPENAI_ADMIN_KEY` is needed only for programmatic tunnel CRUD and is not installed in the service.
 
@@ -17,17 +17,26 @@ The tunnel runtime's `CONTROL_PLANE_API_KEY` authenticates tunnel-client to Open
 
 ### Owner prerequisites
 
-1. In [Platform Tunnels](https://platform.openai.com/settings/organization/tunnels), create the tunnel object and copy its `tunnel_…` ID. The installed client requires 32 lowercase letters or digits after `tunnel_`.
-2. Ensure the principal behind the existing runtime key has **Tunnels Read + Use** for that tunnel.
-3. Associate the tunnel with the intended ChatGPT workspace as well as its Platform organization. An organization-only association does not automatically make it visible in a workspace.
-4. Ensure the person creating the ChatGPT plugin has **Tunnels Read + Use** and workspace permission to add a custom MCP server.
-5. Do not add an admin key to the long-lived service. This host has no discovered admin key, and the setup does not require one.
+1. Use a Linux host with systemd user services that can reach the loopback MMF hub and make outbound HTTPS connections to OpenAI. This repository does not provide a macOS tunnel-service installer.
+2. Install `tunnel-client` 0.0.9 from the download in [Platform Tunnels](https://platform.openai.com/settings/organization/tunnels) or the latest public release linked by the official [Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), and confirm `tunnel-client --version`.
+3. In Platform Tunnels, create the tunnel object and copy its `tunnel_…` ID. The installed client requires 32 lowercase letters or digits after `tunnel_`.
+4. Create or obtain a runtime API key whose principal has **Tunnels Read + Use** for that tunnel. Store it in a private environment file as exactly one `CONTROL_PLANE_API_KEY=…` assignment. Do not put the key on the command line.
+5. Associate the tunnel with the intended ChatGPT workspace as well as its Platform organization. An organization-only association does not automatically make it visible in a workspace.
+6. Ensure the person creating the ChatGPT plugin has **Tunnels Read + Use** and workspace permission to add a custom MCP server.
+7. Do not add an admin key to the long-lived service. The setup does not require one.
 
 ### Create the local profile and unit
 
 ```bash
-cd ~/workspace/projects/mcp-machine-fabric
-./scripts/setup-openai-tunnel.sh tunnel_<32-lowercase-characters>
+cd /path/to/mcp-machine-fabric
+install -d -m 700 ~/.config/mmf
+if [[ ! -e ~/.config/mmf/openai-tunnel.env ]]; then
+  install -m 600 /dev/null ~/.config/mmf/openai-tunnel.env
+fi
+chmod 600 ~/.config/mmf/openai-tunnel.env
+${EDITOR:-vi} ~/.config/mmf/openai-tunnel.env   # add CONTROL_PLANE_API_KEY=…
+OPENAI_TUNNEL_RUNTIME_ENV="$HOME/.config/mmf/openai-tunnel.env" \
+  ./scripts/setup-openai-tunnel.sh tunnel_<32-lowercase-characters>
 systemctl --user daemon-reload
 systemctl --user enable --now mmf-openai-tunnel.service
 ```
@@ -38,7 +47,7 @@ The script:
 - creates or reuses `~/.config/mmf/pat-openai-tunnel.token`;
 - stores the complete header value in `~/.config/mmf/pat-openai-tunnel.authorization`;
 - writes both files with mode `0600` and never prints their contents;
-- reuses the `EnvironmentFile=` reference from `arxiv-mcp-tunnel.service` for `CONTROL_PLANE_API_KEY` without copying the key;
+- uses the file named by `OPENAI_TUNNEL_RUNTIME_ENV`; when that variable is absent, it can reuse the `EnvironmentFile=` reference from an existing `arxiv-mcp-tunnel.service`;
 - parses only the required runtime-key assignment as data for doctor; it does not execute the EnvironmentFile as shell code;
 - writes `~/.config/tunnel-client/mmf-hub.yaml` and `~/.config/systemd/user/mmf-openai-tunnel.service`;
 - refuses the protected `arxiv-local` profile and refuses to replace pre-existing profile/unit files that lack its management marker;
@@ -46,7 +55,7 @@ The script:
 - validates a temporary candidate bundle before installing it, backs up existing managed files, and restores them if installation fails;
 - runs `tunnel-client doctor --profile mmf-hub --explain` against that candidate.
 
-The current hub intentionally has no OAuth metadata because its configured `MMF_PUBLIC_URL` is plain HTTP. Doctor therefore reports `oauth_metadata` as failed even when the profile, runtime key reference, MCP target, local reachability, health listener, and UI checks pass. The script reads doctor’s JSON report and accepts only the sole failure `oauth_metadata` with the exact expected HTTP 404 from the loopback protected-resource URL. A timeout, 5xx, different URL, or additional failed check reported by doctor stops setup. The installed doctor treats a 2xx metadata response as reachable; it does not validate the response body’s OAuth semantics.
+When the local hub has no OAuth metadata, doctor reports `oauth_metadata` as failed even when the profile, runtime key reference, MCP target, local reachability, health listener, and UI checks pass. The script reads doctor’s JSON report and accepts only the sole failure `oauth_metadata` with the exact expected HTTP 404 from the loopback protected-resource URL. A timeout, 5xx, different URL, or additional failed check reported by doctor stops setup. A hub that does publish metadata can pass the check. The installed doctor treats a 2xx metadata response as reachable; it does not validate the response body’s OAuth semantics.
 
 ### Verify the local runtime
 
@@ -74,8 +83,9 @@ Keep `mmf-openai-tunnel.service` running during discovery and every later MCP ca
 4. Select the tunnel or paste its `tunnel_…` ID.
 5. Choose **No authentication**. The local tunnel profile supplies the PAT.
 6. Review the risk warning, select **I understand and want to continue**, and create the plugin.
-7. Review every discovered read, write, and exec action before enabling it broadly.
-8. In a new chat, select the plugin and start with a read-only request such as machine status or a bounded file read.
+7. Find the resulting plugin in your personal plugins or workspace and install it.
+8. Review every discovered read, write, and exec action before enabling it broadly.
+9. In a new chat, select the plugin and start with a read-only request such as machine status or a bounded file read.
 
 If the tunnel is absent from the selector, check its ChatGPT-workspace association and the plugin creator’s Tunnels Read + Use permissions before changing local configuration. UI labels can change; the official [Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) is controlling.
 
@@ -88,11 +98,14 @@ Header-file values are resolved at tunnel-client startup. Rotation therefore req
 Stop only the MMF tunnel, locate and revoke the token named `openai-tunnel`, remove this tunnel’s two local files, rerun setup, then start and verify it:
 
 ```bash
+test -r ~/.config/mmf/openai-tunnel.env
+tunnel-client --version
 systemctl --user stop mmf-openai-tunnel.service
 node ~/.local/opt/mcp-machine-fabric/current/dist/cli.js token list
 node ~/.local/opt/mcp-machine-fabric/current/dist/cli.js token revoke <token-id>
 rm ~/.config/mmf/pat-openai-tunnel.token ~/.config/mmf/pat-openai-tunnel.authorization
-./scripts/setup-openai-tunnel.sh tunnel_<32-lowercase-characters>
+OPENAI_TUNNEL_RUNTIME_ENV="$HOME/.config/mmf/openai-tunnel.env" \
+  ./scripts/setup-openai-tunnel.sh tunnel_<32-lowercase-characters>
 systemctl --user daemon-reload
 systemctl --user start mmf-openai-tunnel.service
 curl -fsS http://127.0.0.1:8082/readyz
@@ -181,7 +194,7 @@ Primary upstream references:
 - [tunnel-client configuration](https://github.com/openai/tunnel-client/blob/master/docs/configuration.md)
 - [tunnel-client repository](https://github.com/openai/tunnel-client)
 - [OpenAI Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)
-- [ChatGPT developer mode and MCP apps](https://help.openai.com/en/articles/12584461-developer-mode-and-full-mcp-connectors-in-chatgpt)
+- [Add a custom MCP server](https://developers.openai.com/api/docs/guides/custom-mcp-server)
 - [Tailscale Funnel CLI](https://tailscale.com/docs/reference/tailscale-cli/funnel)
 - [Tailscale Funnel requirements](https://tailscale.com/kb/1223/funnel)
 
@@ -190,10 +203,12 @@ Primary upstream references:
 Command:
 
 ```bash
-./scripts/setup-openai-tunnel.sh tunnel_0123456789abcdef --dry-run
+OPENAI_TUNNEL_RUNTIME_ENV="$HOME/.config/mmf/openai-tunnel.env" \
+  ./scripts/setup-openai-tunnel.sh tunnel_0123456789abcdef --dry-run
 ```
 
-Doctor output, verbatim (no secret values were present):
+Doctor output from the original isolated run, verbatim (no secret values were
+present; temporary and home-directory paths vary by host):
 
 ```text
 CHECK config_source            PASS profile: mmf-hub

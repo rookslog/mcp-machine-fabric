@@ -28,8 +28,12 @@ machine, within that agent's operating-system permissions.
 ## Run the hub with Docker
 
 This path was exercised on Linux during the `0.1.0` packaging check.
+Run it from a repository checkout; the Docker and source/systemd sections are
+alternative ways to host the same hub.
 
 ```bash
+git clone https://github.com/rookslog/mcp-machine-fabric.git
+cd mcp-machine-fabric
 docker build --tag mcp-machine-fabric:0.1.0 .
 docker volume create mmf-data
 docker run --detach \
@@ -49,10 +53,17 @@ Set the owner passphrase and enroll a machine from inside the container:
 ```bash
 docker exec --interactive --tty mmf-hub node /app/dist/cli.js passphrase
 docker exec mmf-hub node /app/dist/cli.js device add laptop
-docker exec mmf-hub node /app/dist/cli.js token create operator
+mkdir -p ~/.config/mmf && chmod 700 ~/.config/mmf
+umask 077
+token_output=$(docker exec mmf-hub node /app/dist/cli.js token create operator)
+printf '%s\n' "$token_output"
+printf '%s\n' "$token_output" | awk '/^mmf_pat_/ { print; exit }' > ~/.config/mmf/operator.token
+unset token_output
+chmod 600 ~/.config/mmf/operator.token
 ```
 
-Each token is printed once. Move it to its final private file immediately.
+Each token is printed once. The commands above store the operator PAT in its
+final private host file; save the device token privately on the agent host.
 
 ## Run the hub with systemd
 
@@ -65,9 +76,18 @@ cd mcp-machine-fabric
 ./scripts/install-release.sh
 ./scripts/install-hub.sh --public-url https://hub.example.com
 node ~/.local/opt/mcp-machine-fabric/current/dist/cli.js passphrase
+mkdir -p ~/.config/mmf && chmod 700 ~/.config/mmf
+umask 077
+token_output=$(node ~/.local/opt/mcp-machine-fabric/current/dist/cli.js token create operator)
+printf '%s\n' "$token_output"
+printf '%s\n' "$token_output" | awk '/^mmf_pat_/ { print; exit }' > ~/.config/mmf/operator.token
+unset token_output
+chmod 600 ~/.config/mmf/operator.token
 ```
 
 The installer creates a user service and binds the hub to `127.0.0.1:8787`.
+The token command prints the PAT once and stores only its `mmf_pat_…` line in
+the private file used by the status and live checks below.
 Check it with:
 
 ```bash
@@ -142,10 +162,14 @@ Then run `cloudflared tunnel run mmf-hub` and set
 
 ## Install Linux and macOS agents
 
-Create the device on the hub first:
+Create the device on the hub first. Run exactly one form, matching the way the
+hub is hosted (skip this if the Docker setup above already added `laptop`):
 
 ```bash
+# Source/systemd hub:
 node ~/.local/opt/mcp-machine-fabric/current/dist/cli.js device add laptop
+# Docker hub:
+docker exec mmf-hub node /app/dist/cli.js device add laptop
 ```
 
 On the controlled machine, clone the same release and install it:
@@ -173,22 +197,45 @@ root, supply the device token, and set `MMF_STATE_DIR` to a persistent mounted
 directory. The `/data` volume and default health check are hub defaults; they
 do not persist or assess an agent.
 
-Check the connection from the hub with a personal access token:
+Check the connection from the hub with the saved personal access token. Run the
+source/systemd form or the Docker form, matching the hub deployment:
 
 ```bash
+# Source/systemd hub:
 node ~/.local/opt/mcp-machine-fabric/current/dist/cli.js status \
   --url https://hub.example.com \
   --token-file ~/.config/mmf/operator.token
+# Docker hub (passes the current shell's token value as an environment variable):
+MMF_TOKEN="$(cat ~/.config/mmf/operator.token)" \
+  docker exec --env MMF_TOKEN mmf-hub node /app/dist/cli.js status \
+  --url http://127.0.0.1:8787
 ```
 
 The machine is usable when its row says `READY`.
 
+From the repository checkout on the hub, exercise a real PAT-authenticated MCP
+session with the official SDK. This creates a scratch directory inside the
+agent's first allowed root, tests file and command operations, and removes it.
+It requires an agent with write and exec enabled. Run `npm ci` first when the
+Docker route has not already installed checkout dependencies:
+
+```bash
+npm ci --no-audit --no-fund
+MMF_TOKEN="$(cat ~/.config/mmf/operator.token)" node scripts/live-check.mjs \
+  --url https://hub.example.com/mcp --machine laptop
+```
+
+For a read-only or no-exec agent, stop after the read-only `status` check. If a
+full live check reports that cleanup failed, remove its reported
+`.cache/mmf-live-check-*` scratch directory locally on the agent.
+
 ## Connect MCP clients
 
-These client setup paths are supported by the repository configuration but
-were not exercised during the packaging check.
+The PAT-authenticated Streamable HTTP path above was exercised with the
+official SDK during the release-readiness run. The product-specific ChatGPT,
+Claude Code, and Codex registration steps below were not exercised.
 
-- ChatGPT: In developer mode, create an app or connector with
+- ChatGPT: In ChatGPT Plugins, select **+**, then **Add custom MCP server** with
   `https://hub.example.com/mcp` as the MCP server URL. Use OAuth and approve the
   requested scopes with the owner passphrase.
 - Claude Code: Create a PAT with `mmf token create claude-code`, then run
@@ -211,7 +258,8 @@ Grant only the scopes that the client needs: `fabric:read`, `fabric:write`, and
 The hub state is the SQLite database `hub.db` in `MMF_DATA_DIR`. The default
 source installation uses `~/.local/share/mmf-hub`. The container uses `/data`.
 
-Use SQLite's online backup command for a consistent snapshot:
+Install the `sqlite3` command-line client, then use its online backup command
+for a consistent snapshot:
 
 ```bash
 mkdir -p backups
