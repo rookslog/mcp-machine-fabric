@@ -5,6 +5,7 @@ import nodePath from "node:path";
 import { parseArgs } from "node:util";
 import { Agent } from "./agent/agent.js";
 import { normalizePolicy } from "./agent/policy.js";
+import { runDoctor } from "./doctor.js";
 import { createOAuthRouter, FabricOAuthProvider, SCOPES } from "./hub/oauth.js";
 import { createHub, jsonLogger } from "./hub/server.js";
 import { HubStore } from "./hub/store.js";
@@ -24,6 +25,7 @@ Hub (run on the always-on host):
 Agent (run on every machine you want to control):
   mmf agent --hub wss://HUB/agent --token-file FILE [--root DIR ...] [--read-only] [--no-exec] [--state-dir DIR]
             (or MMF_AGENT_TOKEN in the environment)
+  mmf doctor [--hub URL] [--token-file F]   diagnose this agent host
 
 Environment: hub: MMF_DATA_DIR (default ~/.local/share/mmf-hub), MMF_PUBLIC_URL, MMF_PORT, MMF_HOST (comma-separated addresses)
              agent: MMF_HUB_URL, MMF_AGENT_TOKEN, MMF_ROOTS (colon-separated), MMF_READ_ONLY=1, MMF_NO_EXEC=1, MMF_STATE_DIR, MMF_JOB_RETENTION_DAYS (default 7)
@@ -214,6 +216,13 @@ async function main(argv: string[]): Promise<number> {
       process.on("SIGTERM", () => void shutdown("SIGTERM"));
       process.on("SIGINT", () => void shutdown("SIGINT"));
       return new Promise(() => {});
+    }
+    case "doctor": {
+      const { values } = parseArgs({
+        args: rest,
+        options: { hub: { type: "string" }, "token-file": { type: "string" } },
+      });
+      return (await runDoctor({ hubUrl: values.hub, tokenFile: values["token-file"] })).exitCode;
     }
     case "status": {
       const { values } = parseArgs({ args: rest, options: { url: { type: "string" }, "token-file": { type: "string" } } });
