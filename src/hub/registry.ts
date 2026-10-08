@@ -225,9 +225,13 @@ export class Registry {
           // executing it, and guards in-flight receipt in memory, so "unknown"
           // from the owning machine attests the call never ran. Only requests
           // that were never acknowledged qualify; an acknowledged call whose
-          // record is gone (pruned/wiped) stays truthfully unknown.
+          // record is gone (pruned/wiped) stays truthfully unknown, and only the
+          // state directory the call was dispatched to can vouch (two agents
+          // sharing a token but not a state dir cannot speak for each other).
           const row = this.store.getRequest(msg.request_id);
-          if (row && row.machine === conn.machine && (row.state === "dispatched" || row.state === "dispatched_unknown")) {
+          const route = this.store.routeOf(msg.request_id);
+          const sameState = !!route && route === conn.info?.state_id;
+          if (row && row.machine === conn.machine && sameState && (row.state === "dispatched" || row.state === "dispatched_unknown")) {
             this.store.markNeverReceived(msg.request_id);
             this.log("request never reached the agent; marked not_dispatched", { request_id: msg.request_id });
           }
@@ -281,6 +285,7 @@ export class Registry {
         return;
       }
       this.store.setState(requestId, "dispatched");
+      if (conn.info?.state_id) this.store.recordRoute(requestId, conn.info.state_id);
     });
   }
 

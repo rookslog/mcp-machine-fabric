@@ -106,6 +106,10 @@ export class HubStore {
         error_code TEXT,
         outcome_json TEXT
       );
+      CREATE TABLE IF NOT EXISTS request_routes (
+        request_id TEXT PRIMARY KEY,
+        state_id TEXT NOT NULL
+      );
       CREATE INDEX IF NOT EXISTS requests_by_time ON requests(created_at DESC);
       CREATE INDEX IF NOT EXISTS requests_by_machine_state ON requests(machine, state);
       CREATE UNIQUE INDEX IF NOT EXISTS requests_idem ON requests(principal, machine, tool, idempotency_key)
@@ -205,6 +209,15 @@ export class HubStore {
       );
   }
 
+  recordRoute(requestId: string, stateId: string): void {
+    this.db.prepare("INSERT OR REPLACE INTO request_routes (request_id, state_id) VALUES (?, ?)").run(requestId, stateId);
+  }
+
+  routeOf(requestId: string): string | null {
+    const row = this.db.prepare("SELECT state_id FROM request_routes WHERE request_id = ?").get(requestId) as { state_id: string } | undefined;
+    return row?.state_id ?? null;
+  }
+
   /** Terminal "never ran": the agent attested it has no record of the call. */
   markNeverReceived(requestId: string): void {
     const now = Date.now();
@@ -260,6 +273,7 @@ export class HubStore {
     const r = this.db
       .prepare("DELETE FROM requests WHERE created_at < ? AND state IN ('completed', 'failed', 'not_dispatched')")
       .run(Date.now() - olderThanMs);
+    this.db.prepare("DELETE FROM request_routes WHERE request_id NOT IN (SELECT request_id FROM requests)").run();
     return Number(r.changes);
   }
 

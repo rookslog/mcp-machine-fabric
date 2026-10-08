@@ -57,6 +57,13 @@ export interface AgentInfo {
   policy: { read_only: boolean; roots: string[]; allow_exec: boolean };
   /** Agent wall-clock start (ISO), used to detect agent restarts. */
   started_at: string;
+  /**
+   * Stable id of the agent's state directory (persisted there). Recovery
+   * answers are only trusted from the same state directory the call was
+   * dispatched to: two agents sharing one token but not one state dir cannot
+   * vouch for each other.
+   */
+  state_id?: string;
 }
 
 export type AgentToHub =

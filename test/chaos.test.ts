@@ -205,6 +205,10 @@ test("final recovery terminalizes a request absent from the agent cache", async 
       }),
       state: "dispatched_unknown",
     });
+    // A real dispatch records which agent state directory the call went to;
+    // only that state directory may later attest non-receipt.
+    const stateId = (await readFile(nodePath.join(h.agents.alpha.stateDir, "state_id"), "utf8")).trim();
+    h.store.recordRoute(requestId, stateId);
 
     await h.restartHub();
     await waitFor(async () => h.hub.registry.isConnected("alpha"), 6_000, 25);

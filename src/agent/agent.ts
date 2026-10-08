@@ -1,3 +1,5 @@
+import { randomBytes } from "node:crypto";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { homedir, hostname } from "node:os";
 import nodePath from "node:path";
 import { z } from "zod";
@@ -180,6 +182,7 @@ export class Agent {
   private pruneTimer: NodeJS.Timeout | null = null;
   private loopLag = 0;
   readonly startedAt = new Date().toISOString();
+  private stateId: string | undefined;
   machine: string | null = null;
   /** Request ids received by this process and not yet finished (set synchronously on receipt). */
   private received = new Set<string>();
@@ -205,10 +208,20 @@ export class Agent {
       tools: AGENT_TOOLS.map((t) => t.name),
       policy: { read_only: this.opts.policy.read_only, roots: this.opts.policy.roots, allow_exec: this.opts.policy.allow_exec },
       started_at: this.startedAt,
+      state_id: this.stateId,
     };
   }
 
   async start(): Promise<void> {
+    await mkdir(this.opts.stateDir, { recursive: true, mode: 0o700 });
+    const idFile = nodePath.join(this.opts.stateDir, "state_id");
+    this.stateId = (await readFile(idFile, "utf8").catch(() => "")).trim() || undefined;
+    if (!this.stateId) {
+      this.stateId = `s_${randomBytes(8).toString("hex")}`;
+      await writeFile(idFile, this.stateId + "\n", { mode: 0o600, flag: "wx" }).catch(async () => {
+        this.stateId = (await readFile(idFile, "utf8")).trim();
+      });
+    }
     await this.executor.init();
     await this.cache.init();
     const retention = this.opts.jobRetentionMs ?? 7 * 24 * 3600 * 1000;

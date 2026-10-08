@@ -57,7 +57,10 @@ Rules:
    acknowledged, the call provably never ran: the hub marks it
    `not_dispatched` (`error_code: never_received`). An acknowledged call whose
    record has since vanished (pruned after 24 h, state dir wiped) stays
-   `dispatched_unknown`.
+   `dispatched_unknown`. Each agent state directory has a persistent
+   `state_id`; the hub records which one a call was dispatched to and accepts
+   "never received" only from that same state directory, so two agents
+   sharing one device token cannot vouch for each other.
 6. **Idempotency keys** are scoped to (principal, machine, tool, key). A repeat
    returns the recorded outcome (`replayed: true`) or, if the first call is
    still unresolved, its state — never a second execution. A request that ended

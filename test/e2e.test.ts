@@ -208,6 +208,43 @@ describe("hub + agents end to end", () => {
     expect(h.hub.registry.isConnected("beta")).toBe(false);
   });
 
+  it("a second agent with the same token but another state dir cannot vouch that a call never ran", async () => {
+    const c = await h.client();
+    const marker = nodePath.join(h.agents.alpha.root, "dup.txt");
+    const pending = call(c, "run_command", {
+      machine: "alpha",
+      command: `sleep 1; echo ran >> ${JSON.stringify(marker)}`,
+      wait_seconds: 5,
+      cwd: h.agents.alpha.root,
+      idempotency_key: "dup-agent-0001",
+    });
+    await new Promise((r) => setTimeout(r, 300));
+    const { Agent } = await import("../src/agent/agent.js");
+    const { normalizePolicy } = await import("../src/agent/policy.js");
+    const imposter = new Agent({
+      hubUrl: `ws://127.0.0.1:${h.port}/agent`,
+      token: h.agents.alpha.token,
+      policy: await normalizePolicy({ roots: [h.agents.alpha.root] }),
+      stateDir: nodePath.join(h.dir, "state-alpha-duplicate"),
+      minBackoffMs: 5000,
+      maxBackoffMs: 5000,
+    });
+    await imposter.start();
+    try {
+      const r = await pending;
+      const id = r.structuredContent!.request_id as string;
+      // Whatever the client saw, the ledger must never claim "never ran" for a call that ran.
+      const final = await waitFor(async () => {
+        const row = h.store.getRequest(id);
+        return row && (row.state === "completed" || row.state === "not_dispatched") ? row : null;
+      }, 15_000, 100).catch(() => h.store.getRequest(id));
+      expect(await readFile(marker, "utf8")).toBe("ran\n");
+      expect(final!.state).not.toBe("not_dispatched");
+    } finally {
+      await imposter.stop();
+    }
+  });
+
   it("records an audit trail with summarized arguments", async () => {
     const c = await h.client();
     const big = "x".repeat(5000);
