@@ -364,7 +364,7 @@ export class FabricOAuthProvider implements OAuthServerProvider {
       clientId: access.client_id,
       scopes: JSON.parse(access.scopes_json) as string[],
       expiresAt: access.expires_at,
-      resource: new URL(this.#mcpResourceUrl),
+      resource: new URL(access.resource),
     };
   }
 
