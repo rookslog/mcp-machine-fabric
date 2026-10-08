@@ -54,6 +54,10 @@ describe("hub + agents end to end", () => {
     expect(text(rb)).toContain("from beta");
     // Clients that render only structuredContent must still see the payload.
     expect(rb.structuredContent!.text).toContain("from beta");
+    // Listing and search results are readable as text, not only as structured data.
+    expect(text(await call(c, "list_directory", { machine: "beta", path: h.agents.beta.root }))).toContain("b.txt");
+    const found = await call(c, "search_files", { machine: "beta", path: h.agents.beta.root, content_regex: "from be+ta" });
+    expect(text(found)).toMatch(/b\.txt:1: from beta/);
     // alpha's policy root does not include beta's directory
     const cross = await call(c, "read_file", { machine: "alpha", path: fb });
     expect(cross.isError).toBe(true);
@@ -191,6 +195,17 @@ describe("hub + agents end to end", () => {
     expect(w.structuredContent!.error_code).toBe("policy_denied");
     const x = await call(c, "run_command", { machine: "beta", command: "echo hi" });
     expect(x.structuredContent!.error_code).toBe("policy_denied");
+  });
+
+  it("disconnects a connected agent once its device is revoked, and refuses its reconnect", async () => {
+    const c = await h.client();
+    expect(h.store.revokeDevice("beta")).toBe(true);
+    await waitFor(async () => !h.hub.registry.isConnected("beta"), 5000);
+    const r = await call(c, "read_file", { machine: "beta", path: nodePath.join(h.agents.beta.root, "x") });
+    // A revoked machine is no longer offered in the `machine` enum, so the call is rejected outright.
+    expect(r.isError).toBe(true);
+    await new Promise((res) => setTimeout(res, 600));
+    expect(h.hub.registry.isConnected("beta")).toBe(false);
   });
 
   it("records an audit trail with summarized arguments", async () => {

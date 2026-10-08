@@ -118,6 +118,12 @@ export class Registry {
   private tick(): void {
     const now = Date.now();
     for (const c of this.conns.values()) {
+      // Revocation may happen in another process (the CLI); enforce it here.
+      if (!this.store.isDeviceActive(c.deviceId)) {
+        this.log("device revoked; disconnecting", { machine: c.machine });
+        c.ws.close(4001, "device revoked");
+        continue;
+      }
       if (now - c.lastPongAt > this.hbTimeout) {
         this.log("agent heartbeat timeout; closing", { machine: c.machine });
         c.ws.terminate();

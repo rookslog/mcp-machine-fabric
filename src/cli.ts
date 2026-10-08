@@ -19,6 +19,7 @@ Hub (run on the always-on host):
   mmf device list | revoke <name>
   mmf token create <name> [--scopes fabric:read,fabric:write,fabric:exec]
   mmf token list | revoke <id>        personal access tokens for CLI MCP clients
+  mmf status [--url URL] [--token-file F]   machine health as the hub sees it
 
 Agent (run on every machine you want to control):
   mmf agent --hub wss://HUB/agent --token-file FILE [--root DIR ...] [--read-only] [--no-exec] [--state-dir DIR]
@@ -114,7 +115,11 @@ async function main(argv: string[]): Promise<number> {
       try {
         if (sub === "add" && name) {
           const { token } = store.addDevice(name);
-          console.log(`Enrolled ${name}. Device token (shown once; store it in a 0600 file on that machine):\n${token}`);
+          const pub = process.env.MMF_PUBLIC_URL?.replace(/\/+$/, "");
+          const wsUrl = pub ? `${pub.replace(/^http/, "ws")}/agent` : "wss://<hub>/agent";
+          console.log(`Enrolled ${name}. Device token (shown once):\n${token}\n`);
+          console.log(`On ${name}, from a checkout of this repo (after ./scripts/install-release.sh):`);
+          console.log(`  echo '<token>' | ./scripts/install-agent.sh --hub ${wsUrl} --root ~`);
         } else if (sub === "list") {
           for (const d of store.listDevices()) {
             console.log(`${d.name}\t${d.revoked_at ? "revoked" : "active"}\tlast_seen=${d.last_seen_at ? new Date(d.last_seen_at).toISOString() : "never"}`);
@@ -192,6 +197,28 @@ async function main(argv: string[]): Promise<number> {
       process.on("SIGTERM", () => void shutdown("SIGTERM"));
       process.on("SIGINT", () => void shutdown("SIGINT"));
       return new Promise(() => {});
+    }
+    case "status": {
+      const { values } = parseArgs({ args: rest, options: { url: { type: "string" }, "token-file": { type: "string" } } });
+      const base = (values.url ?? process.env.MMF_PUBLIC_URL ?? "http://127.0.0.1:8787").replace(/\/+$/, "");
+      const token = values["token-file"] ? readFileSync(values["token-file"], "utf8").trim() : process.env.MMF_TOKEN;
+      if (!token) {
+        console.error("status needs --token-file or MMF_TOKEN (a PAT with fabric:read)");
+        return 2;
+      }
+      const res = await fetch(`${base}/api/status`, { headers: { Authorization: `Bearer ${token}` } });
+      if (!res.ok) {
+        console.error(`hub answered ${res.status}`);
+        return 1;
+      }
+      const body = (await res.json()) as { version: string; machines: Array<Record<string, any>> };
+      console.log(`hub ${base} v${body.version}`);
+      for (const m of body.machines) {
+        console.log(
+          `${m.machine.padEnd(16)} ${m.ready ? "READY    " : "NOT READY"} ${m.reason ?? ""}${m.agent ? ` ${m.agent.platform}/${m.agent.arch} agent ${m.agent.agent_version}` : ""}${m.heartbeat_rtt_ms != null ? ` rtt=${m.heartbeat_rtt_ms}ms` : ""}${m.executor ? ` jobs=${m.executor.running_jobs}` : ""} last_seen=${m.last_seen ?? "never"}`,
+        );
+      }
+      return 0;
     }
     case "version":
     case "--version":

@@ -203,6 +203,12 @@ else
   if (( dry_run == 0 && no_start == 0 )); then
     domain="gui/$(id -u)"
     launchctl bootout "$domain/dev.mcp-machine-fabric.agent" >/dev/null 2>&1 || true
+    # bootout is asynchronous; bootstrapping before the old instance is gone
+    # fails with "5: Input/output error". Wait for it to disappear.
+    for _ in $(seq 1 50); do
+      launchctl print "$domain/dev.mcp-machine-fabric.agent" >/dev/null 2>&1 || break
+      sleep 0.2
+    done
     launchctl bootstrap "$domain" "$plist"
     launchctl kickstart -k "$domain/dev.mcp-machine-fabric.agent"
   fi

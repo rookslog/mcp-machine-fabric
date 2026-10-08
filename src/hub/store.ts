@@ -143,6 +143,11 @@ export class HubStore {
       .all() as unknown as DeviceRow[];
   }
 
+  isDeviceActive(id: string): boolean {
+    const row = this.db.prepare("SELECT revoked_at FROM devices WHERE id = ?").get(id) as { revoked_at: number | null } | undefined;
+    return !!row && !row.revoked_at;
+  }
+
   revokeDevice(name: string): boolean {
     const r = this.db
       .prepare("UPDATE devices SET revoked_at = ? WHERE name = ? AND revoked_at IS NULL")
