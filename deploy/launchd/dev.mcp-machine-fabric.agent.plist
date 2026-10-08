@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- Template: scripts/install-agent.sh fills @NODE@, @HOME@, @HUB_URL@. -->
+<!-- Template: scripts/install-agent.sh XML-escapes and fills all @...@ values. -->
 <plist version="1.0">
 <dict>
   <key>Label</key><string>dev.mcp-machine-fabric.agent</string>
@@ -9,11 +9,17 @@
     <string>@NODE@</string>
     <string>@HOME@/.local/opt/mcp-machine-fabric/current/dist/cli.js</string>
     <string>agent</string>
-    <string>--hub</string><string>@HUB_URL@</string>
     <string>--token-file</string><string>@HOME@/.config/mmf/agent.token</string>
   </array>
   <key>EnvironmentVariables</key>
-  <dict><key>PATH</key><string>@PATH@</string></dict>
+  <dict>
+    <key>HOME</key><string>@HOME@</string>
+    <key>PATH</key><string>@PATH@</string>
+    <key>MMF_HUB_URL</key><string>@MMF_HUB_URL@</string>
+    <key>MMF_ROOTS</key><string>@MMF_ROOTS@</string>
+    <key>MMF_READ_ONLY</key><string>@MMF_READ_ONLY@</string>
+    <key>MMF_NO_EXEC</key><string>@MMF_NO_EXEC@</string>
+  </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <!-- Durable jobs run in their own process groups; never reap them when the agent exits. -->
