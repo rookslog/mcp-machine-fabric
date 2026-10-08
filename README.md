@@ -71,7 +71,17 @@ alias mmf="node ~/.local/opt/mcp-machine-fabric/current/dist/cli.js"
 
 ```bash
 mmf passphrase                           # owner passphrase for OAuth consent (stdin)
-MMF_PUBLIC_URL=https://hub.example.ts.net mmf hub --port 8787
+MMF_PUBLIC_URL=https://hub.example.ts.net:8443 mmf hub --port 8787
+```
+
+Enter a passphrase of at least 12 characters and finish standard input with
+Ctrl-D before starting the hub.
+Leave the hub running. In a second terminal, return to the checkout and recreate
+the shell-local alias before running the remaining hub commands:
+
+```bash
+cd mcp-machine-fabric
+alias mmf="node ~/.local/opt/mcp-machine-fabric/current/dist/cli.js"
 ```
 
 The hub listens on `127.0.0.1` only. Put TLS in front of it, e.g. on a tailnet:
@@ -92,13 +102,30 @@ On the hub host:
 
 ```bash
 mmf device add laptop                    # prints a device token once
+mkdir -p ~/.config/mmf && chmod 700 ~/.config/mmf
+umask 077
+token_output=$(mmf token create operator)
+printf '%s\n' "$token_output"
+printf '%s\n' "$token_output" | awk '/^mmf_pat_/ { print; exit }' > ~/.config/mmf/operator.token
+unset token_output
+chmod 600 ~/.config/mmf/operator.token
 ```
 
-On the machine to control, the easiest path is the installer (systemd on Linux,
-launchd on macOS; it stores the token with mode 0600):
+The token command prints the PAT once and stores only its `mmf_pat_…` line in
+the private file used below.
+
+On each separate machine to control, clone the same revision and install it as
+shown in the first Quick start block. Save the one-time device token without
+putting it in shell history:
 
 ```bash
-echo '<device token>' | ./scripts/install-agent.sh --hub wss://hub.example.ts.net:8443/agent --root ~
+mkdir -p ~/.config/mmf && chmod 700 ~/.config/mmf
+read -rsp "Paste device token: " MMF_DEVICE_TOKEN && printf '\n'
+printf '%s\n' "$MMF_DEVICE_TOKEN" > ~/.config/mmf/agent.token
+unset MMF_DEVICE_TOKEN
+chmod 600 ~/.config/mmf/agent.token
+./scripts/install-agent.sh --hub wss://hub.example.ts.net:8443/agent \
+  --token-file ~/.config/mmf/agent.token --root ~
 ```
 
 Or run it in the foreground:
@@ -112,13 +139,25 @@ Service templates: [systemd](deploy/systemd/mmf-agent.service) (note
 `KillMode=process`, which keeps jobs alive across agent restarts) and
 [launchd](deploy/launchd/dev.mcp-machine-fabric.agent.plist).
 
+When the agent reports connected, check its status and exercise the same MCP
+SDK path used by clients. The live check creates a scratch directory inside the
+agent's first allowed root, tests file and command operations, then removes it.
+It requires write and exec to be enabled; restrictive agents should use the
+read-only status command without the live check:
+
+```bash
+mmf status --url https://hub.example.ts.net:8443 --token-file ~/.config/mmf/operator.token
+MMF_TOKEN="$(cat ~/.config/mmf/operator.token)" \
+  node scripts/live-check.mjs --url https://hub.example.ts.net:8443/mcp --machine laptop
+```
+
 ### 3. Clients
 
-- **ChatGPT** (developer mode → Create app/connector): MCP server URL
+- **ChatGPT** (Plugins → **+** → **Add custom MCP server**): MCP server URL
   `https://<hub>/mcp`, authentication OAuth. ChatGPT registers itself, you
   approve it on the hub's consent page with the owner passphrase and choose
-  scopes. Alternatively connect through an OpenAI Secure MCP Tunnel
-  (`tunnel-client init --mcp-server-url http://127.0.0.1:8787/mcp`).
+  scopes. Alternatively connect through an OpenAI Secure MCP Tunnel; follow
+  [the dedicated setup guide](docs/CHATGPT.md).
 - **Claude Code**: `claude mcp add --transport http fabric https://<hub>/mcp --header "Authorization: Bearer $(cat token)"`
   with a token from `mmf token create claude-code`, or omit the header to use OAuth.
 - **Codex CLI**: in `~/.codex/config.toml`:

@@ -23,3 +23,11 @@ All notable changes to this project are documented in this file.
   refresh-token reuse detection.
 - Agent policy is enforced on the controlled machine, including resolved path
   boundaries and optional write or execution denial.
+
+### Documentation
+
+- Exercised the source and Docker self-hosting paths in an isolated environment
+  and added the missing PAT-storage, status, and official-SDK live-check steps.
+- Clarified the OpenAI tunnel runtime-key file and removed host-specific checkout
+  assumptions while keeping external tunnel and ChatGPT actions explicitly
+  unexercised.
