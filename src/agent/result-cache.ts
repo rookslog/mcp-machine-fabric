@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import { mkdir, readdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
 import nodePath from "node:path";
 import type { ToolOutcome } from "../shared/protocol.js";
@@ -22,6 +23,8 @@ const ID_RE = /^r_[a-z0-9]+_[a-f0-9]+$/;
  * drop). Written before the agent acknowledges a call, updated on completion.
  */
 export class ResultCache {
+  private mutations = new Map<string, Promise<void>>();
+
   constructor(
     private dir: string,
     private agentRun: string,
@@ -40,31 +43,48 @@ export class ResultCache {
 
   private async write(rec: CachedResult): Promise<void> {
     const f = this.file(rec.request_id);
-    const tmp = `${f}.${process.pid}.tmp`;
+    const tmp = `${f}.${process.pid}.${randomBytes(6).toString("hex")}.tmp`;
     await writeFile(tmp, JSON.stringify(rec), { mode: 0o600 });
     await rename(tmp, f);
   }
 
+  private async mutate(requestId: string, operation: () => Promise<void>): Promise<void> {
+    const previous = this.mutations.get(requestId) ?? Promise.resolve();
+    const current = previous.then(operation, operation);
+    this.mutations.set(requestId, current);
+    try {
+      await current;
+    } finally {
+      if (this.mutations.get(requestId) === current) this.mutations.delete(requestId);
+    }
+  }
+
   async begin(requestId: string, tool: string): Promise<void> {
-    await this.write({ request_id: requestId, tool, state: "running", agent_run: this.agentRun, started_at: new Date().toISOString() });
+    await this.mutate(requestId, async () => {
+      await this.write({ request_id: requestId, tool, state: "running", agent_run: this.agentRun, started_at: new Date().toISOString() });
+    });
   }
 
   async noteJob(requestId: string, jobId: string): Promise<void> {
-    const rec = await this.get(requestId);
-    if (rec && rec.state === "running") await this.write({ ...rec, job_id: jobId });
+    await this.mutate(requestId, async () => {
+      const rec = await this.get(requestId);
+      if (rec && rec.state === "running") await this.write({ ...rec, job_id: jobId });
+    });
   }
 
   async finish(requestId: string, tool: string, outcome: ToolOutcome): Promise<void> {
-    const prev = await this.get(requestId);
-    await this.write({
-      request_id: requestId,
-      tool,
-      state: outcome.ok ? "completed" : "failed",
-      agent_run: this.agentRun,
-      started_at: prev?.started_at ?? new Date().toISOString(),
-      finished_at: new Date().toISOString(),
-      outcome,
-      job_id: prev?.job_id,
+    await this.mutate(requestId, async () => {
+      const prev = await this.get(requestId);
+      await this.write({
+        request_id: requestId,
+        tool,
+        state: outcome.ok ? "completed" : "failed",
+        agent_run: this.agentRun,
+        started_at: prev?.started_at ?? new Date().toISOString(),
+        finished_at: new Date().toISOString(),
+        outcome,
+        job_id: prev?.job_id,
+      });
     });
   }
 
