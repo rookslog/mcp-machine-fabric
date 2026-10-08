@@ -114,6 +114,8 @@ export async function runFsTool(
   }
 }
 
+const MAX_RESPONSE_BYTES = 256 * 1024;
+
 async function readFileTool(policy: Policy, args: Record<string, any>): Promise<ToolOutcome> {
   const checked = await checkedPath(policy, args.path, "read");
   const info = await stat(checked);
@@ -131,9 +133,24 @@ async function readFileTool(policy: Policy, args: Record<string, any>): Promise<
     requestedOffset < 0 ? Math.max(0, lines.length + requestedOffset) : requestedOffset,
   );
   const length = args.length ?? 1000;
-  const selected = lines.slice(offset, offset + length);
+  // Bound the response size too: 1000 lines of minified code can be megabytes.
+  const selected: string[] = [];
+  let bytes = 0;
+  let cutByBytes = false;
+  for (const line of lines.slice(offset, offset + length)) {
+    const size = Buffer.byteLength(line) + 1;
+    if (selected.length > 0 && bytes + size > MAX_RESPONSE_BYTES) {
+      cutByBytes = true;
+      break;
+    }
+    selected.push(size > MAX_RESPONSE_BYTES ? line.slice(0, MAX_RESPONSE_BYTES) + " …[line truncated]" : line);
+    bytes += size;
+  }
   const last = selected.length === 0 ? offset : offset + selected.length - 1;
-  const header = `[lines ${offset}-${last} of ${lines.length}]`;
+  const next = offset + selected.length;
+  const header =
+    `[lines ${offset}-${last} of ${lines.length}]` +
+    (next < lines.length ? ` — more: read_file with offset=${next}${cutByBytes ? " (stopped at the response size limit)" : ""}` : "");
 
   return {
     ok: true,

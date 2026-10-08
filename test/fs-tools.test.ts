@@ -65,6 +65,19 @@ describe("runFsTool", () => {
     await rm(sandbox, { recursive: true, force: true });
   });
 
+  test("read_file bounds the response size and says where to continue", async () => {
+    const file = path.join(root, "wide.txt");
+    const line = "x".repeat(100_000);
+    await writeFile(file, Array.from({ length: 10 }, () => line).join("\n"));
+    const outcome = await runFsTool(policy, "read_file", { path: file });
+    expect(outcome.ok).toBe(true);
+    if (!outcome.ok) return;
+    expect(Buffer.byteLength(outcome.text)).toBeLessThan(400_000);
+    expect(outcome.text).toMatch(/more: read_file with offset=2 \(stopped at the response size limit\)/);
+    const rest = await runFsTool(policy, "read_file", { path: file, offset: 2 });
+    expect(rest.ok && rest.text.startsWith("[lines 2-")).toBe(true);
+  });
+
   test("read_file reads a negative offset and hashes the whole file", async () => {
     const file = path.join(root, "lines.txt");
     await writeFile(file, "zero\none\ntwo\nthree");
@@ -89,7 +102,7 @@ describe("runFsTool", () => {
     const outcome = success(await runFsTool(policy, "read_file", { path: file }));
 
     expect(outcome.data).toMatchObject({ total_lines: 1001, offset: 0, lines_returned: 1000, truncated: true });
-    expect(outcome.text.startsWith("[lines 0-999 of 1001]\nline-0\n")).toBe(true);
+    expect(outcome.text.startsWith("[lines 0-999 of 1001] — more: read_file with offset=1000\nline-0\n")).toBe(true);
     expect(outcome.text.endsWith("\nline-999")).toBe(true);
   });
 
