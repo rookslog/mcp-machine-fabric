@@ -69,12 +69,19 @@ async function main(argv: string[]): Promise<number> {
       if (!provider.hasOwnerPassphrase()) {
         log("WARNING: no owner passphrase set; OAuth consent cannot be approved until you run `mmf passphrase`");
       }
+      // OAuth 2.1 requires an HTTPS issuer (loopback excepted). Behind plain
+      // HTTP (e.g. a raw tailnet address) only personal access tokens work.
+      const pubUrl = new URL(pub);
+      const oauthOk = pubUrl.protocol === "https:" || ["localhost", "127.0.0.1"].includes(pubUrl.hostname);
+      if (!oauthOk) log("OAuth disabled: public URL is not HTTPS; only personal access tokens (mmf token create) will authenticate", { public_url: pub });
       const hub = createHub({
         store,
         publicUrl: pub,
         hubVersion: VERSION,
         verifier: provider,
-        authRouter: createOAuthRouter({ provider, issuerUrl: new URL(pub), mcpResourceUrl: new URL(`${pub}/mcp`), resourceName: "Machine Fabric" }),
+        authRouter: oauthOk
+          ? createOAuthRouter({ provider, issuerUrl: pubUrl, mcpResourceUrl: new URL(`${pub}/mcp`), resourceName: "Machine Fabric" })
+          : undefined,
         log,
       });
       const bound = await hub.listen(port, host.split(",").map((h) => h.trim()).filter(Boolean));
