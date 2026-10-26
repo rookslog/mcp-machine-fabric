@@ -127,6 +127,11 @@ export function createHub(opts: HubOptions): Hub {
   app.get("/mcp", methodNotAllowed);
   app.delete("/mcp", methodNotAllowed);
 
+  app.use((_error: unknown, _req: Request, res: Response, _next: express.NextFunction) => {
+    if (res.headersSent) { res.end(); return; }
+    res.status(500).json({ error: "Internal server error" });
+  });
+
   const server = createServer(app);
   const extraServers: Server[] = [];
   const wss = new WebSocketServer({ noServer: true, maxPayload: 64 * 1024 * 1024 });

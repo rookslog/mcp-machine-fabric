@@ -372,7 +372,7 @@ describe("security regressions", () => {
     expect(consent.html).not.toMatch(/value="beta" checked/);
   });
 
-  test("LOW-6 prunes expired OAuth state and caps unused registrations", async () => {
+  test("LOW-6 prunes expired OAuth state and evicts unused registrations at the cap", async () => {
     const start = 1_800_000_000_000;
     const harness = await makeOAuthHarness(start);
     const staleClient = await registerClient(harness);
@@ -399,8 +399,9 @@ describe("security regressions", () => {
       await harness.provider.clientsStore.registerClient(metadata);
     }
     const capped = await registerClient(harness, { client_name: "Client 501" });
-    expect(capped.response.status).toBe(400);
-    expect(capped.body).toMatchObject({ error: "invalid_request" });
+    expect(capped.response.status).toBe(201);
+    expect((harness.db.prepare("SELECT COUNT(*) AS count FROM oauth_clients").get() as { count: number }).count).toBe(500);
+    expect(await harness.provider.clientsStore.getClient(trigger.body.client_id)).toBeUndefined();
   });
 
   test("LOW-6 migration preserves a legacy client that already issued tokens", async () => {

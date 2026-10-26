@@ -54,7 +54,7 @@ export interface AgentInfo {
   /** Tool names this agent can execute. */
   tools: string[];
   /** Summary of local policy so clients can see scope without probing. */
-  policy: { read_only: boolean; roots: string[]; allow_exec: boolean };
+  policy: { read_only: boolean; roots: string[]; allow_exec: boolean; deny_paths?: string[] };
   /** Agent wall-clock start (ISO), used to detect agent restarts. */
   started_at: string;
   /**

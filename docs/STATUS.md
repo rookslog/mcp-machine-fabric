@@ -3,7 +3,7 @@
 Living record of what is verified, how, and what is not. Update it in the same
 change as anything it describes.
 
-_Last updated: 2026-10-08 (initial build night)._
+_Last updated: 2026-10-25 (auth review follow-up; deployment observations below remain the original snapshot)._
 
 ## Deployment (owner's machines)
 
@@ -67,6 +67,24 @@ resource (a token minted for another resource was accepted); revoked devices
 stayed connected until reconnect; `read_file` had no response-size cap;
 installer arrays broke under bash 3.2.
 
+The subsequent Claude Opus auth review of `e2c9e77` found seven further issues,
+now addressed by the AUTH-FIXES Sol lane with permanent regression tests:
+private state/device-token reads through broad roots; synchronous and
+address-rotatable consent guessing; anonymous registration-cap lockout;
+filesystem replacement races in search/info/list/mkdir; fail-open PAT scope
+parsing; authorization stack/path disclosure and invalid-scope errors; and TTY
+passphrase echo. Tests are `private-paths`, `oauth-approval-budget`,
+`oauth-client-capacity`, `fs-path-replacement`, `pat-scope-validation`,
+`oauth-error-handling`, and `passphrase-input` under `test/`. The original
+bounded race is retained as `fs-search-race.stress.test.ts`, outside the default
+suite; run it with `MMF_RACE_STRESS=1 npx vitest run test/fs-search-race.stress.test.ts`.
+See SECURITY.md for remaining filesystem race limits and the Python 3 fallback
+for descriptor-relative directory creation on non-Linux POSIX hosts. Local follow-up validation: 21 files passed, 166 tests passed / 1 skipped
+under the shared lock with one worker on the final source; the separate bounded stress test also
+passed. The lane report records red/green receipts and all prior non-green runs. Original-reviewer
+re-review, remote ubuntu/macOS CI and any release/deployment remain pending.
+
+
 ## Not verified / known gaps
 
 - **ChatGPT itself has not connected yet.** Every protocol step it needs is
@@ -84,8 +102,9 @@ installer arrays broke under bash 3.2.
   consent defaults and unbounded OAuth storage. All fixed with regression tests
   (`test/security-regressions.test.ts`), together with machine-scoped grants
   (`machine:<name>` scopes on the consent page and `mmf token create
-  --machines`). The fixes were reviewed by the implementing worker's own
-  reviewer, not re-reviewed by the original reviewer.
+  --machines`). Claude Opus independently re-reviewed those fixes at `e2c9e77`
+  and found the seven follow-up issues listed above. AUTH-FIXES Sol implemented
+  this follow-up; its original-reviewer re-review is still a lead-owned gate.
 - Hub is a single process with SQLite; no HA. Restart recovery is tested.
 - ChatGPT's own tool-call timeout is unknown; `run_command` waits 30 s by
   default and hands back a `job_id` for anything longer.

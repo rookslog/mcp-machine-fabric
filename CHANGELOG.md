@@ -2,6 +2,23 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Security
+
+- Deny agent state, device-token/config paths and local hub data through every
+  file tool, including symlink aliases; advertise exclusions in machine policy.
+- Serialize asynchronous consent passphrase checks with IPv6 /64 and global
+  failure budgets, keeping the hub event loop responsive during guessing bursts.
+- Evict stale/unused OAuth registrations without dropping active consent or
+  grants; reject empty/invalid PAT scopes and unknown machine restrictions.
+- Harden search, metadata, listing and directory creation against path swaps;
+  reread ripgrep matches through checked descriptors. Non-Linux directory
+  creation requires Python 3's standard-library descriptor-relative mkdir.
+- Return generic hub errors, validate authorization bodies, and render invalid
+  scope approvals on the consent page.
+- Read interactive owner passphrases without echo and require confirmation.
+
 ## 0.1.0 - 2026-10-08
 
 ### Added

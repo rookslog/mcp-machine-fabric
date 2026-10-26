@@ -16,6 +16,8 @@ export interface Policy {
   allow_exec: boolean;
   /** Absolute, symlink-resolved directory prefixes the file tools may touch. */
   roots: string[];
+  /** Private runtime/configuration paths, denied regardless of roots. */
+  deny_paths?: string[];
 }
 
 export class PolicyError extends Error {
@@ -38,7 +40,13 @@ export async function normalizePolicy(input: Partial<Policy>): Promise<Policy> {
     const abs = nodePath.resolve(expandHome(r));
     resolved.push(await realpathOrSelf(abs));
   }
-  return { read_only: input.read_only ?? false, allow_exec: input.allow_exec ?? true, roots: resolved };
+  const denied = [
+    nodePath.join(homedir(), ".config/mmf"),
+    process.env.MMF_DATA_DIR ?? nodePath.join(homedir(), ".local/share/mmf-hub"),
+    ...(input.deny_paths ?? []),
+  ];
+  const deny_paths = [...new Set(await Promise.all(denied.map((p) => resolveReal(p))))];
+  return { deny_paths, read_only: input.read_only ?? false, allow_exec: input.allow_exec ?? true, roots: resolved };
 }
 
 async function realpathOrSelf(p: string): Promise<string> {
@@ -85,6 +93,9 @@ export async function checkPath(policy: Policy, requested: string, effect: Effec
   }
   if (effect !== "read" && policy.read_only) throw new PolicyError("agent is in read-only mode");
   const real = await resolveReal(requested);
+  for (const denied of policy.deny_paths ?? []) {
+    if (isWithin(denied, real)) throw new PolicyError("path is private to Machine Fabric");
+  }
   if (!policy.roots.some((root) => isWithin(root, real))) {
     throw new PolicyError(`path ${real} is outside the allowed roots (${policy.roots.join(", ")})`);
   }

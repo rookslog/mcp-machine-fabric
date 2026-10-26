@@ -18,13 +18,12 @@
  */
 import { spawn } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
-import { constants } from "node:fs";
+import { constants, type Stats } from "node:fs";
 import {
   cp,
   lstat,
   mkdir,
   open,
-  readFile,
   readlink,
   readdir,
   rename,
@@ -81,7 +80,7 @@ interface DirectoryEntry {
 
 interface VerifiedFile {
   handle: FileHandle;
-  info: Awaited<ReturnType<FileHandle["stat"]>>;
+  info: Stats;
   path: string;
 }
 
@@ -90,6 +89,7 @@ interface VerifiedDirectory {
   path: string;
   policy: Policy;
   requested: string;
+  effect: "read" | "write";
 }
 
 interface MutationTarget {
@@ -211,7 +211,7 @@ async function listDirectoryTool(policy: Policy, args: Record<string, any>): Pro
   async function visit(directory: string, depth: number): Promise<void> {
     if (truncated) return;
     const checkedDirectory = await checkedPath(policy, directory, "read");
-    const children = await readdir(checkedDirectory, { withFileTypes: true });
+    const children = await readVerifiedDirectory(policy, checkedDirectory);
     children.sort((left, right) => {
       const leftDirectory = left.isDirectory();
       const rightDirectory = right.isDirectory();
@@ -229,6 +229,11 @@ async function listDirectoryTool(policy: Policy, args: Record<string, any>): Pro
 
       const childPath = path.join(checkedDirectory, child.name);
       const childInfo = await lstat(childPath);
+      // Listing a link's own metadata does not traverse its target.
+      if (!childInfo.isSymbolicLink()) {
+        try { await checkedPath(policy, childPath, "read"); }
+        catch (error) { if (error instanceof PolicyError) continue; throw error; }
+      }
       const type = fileType(childInfo);
       entries.push({ path: childPath, type, size: childInfo.size });
       if (type === "dir") directories.push(childPath);
@@ -260,26 +265,19 @@ async function listDirectoryTool(policy: Policy, args: Record<string, any>): Pro
 }
 
 async function getFileInfoTool(policy: Policy, args: Record<string, any>): Promise<ToolOutcome> {
-  const checked = await checkedPath(policy, args.path, "read");
-  const info = await stat(checked);
-  const data: Record<string, unknown> = {
-    path: checked,
-    type: fileType(info),
-    size: info.size,
-    mode: (info.mode & 0o7777).toString(8),
-    mtime: info.mtime.toISOString(),
-  };
-
-  if (info.isFile() && info.size < MAX_INFO_TEXT_BYTES) {
-    const content = await readFile(checked);
-    if (!isBinary(content)) data.lines = textLines(content.toString("utf8")).length;
-  }
-
-  return {
-    ok: true,
-    text: `${checked}: ${data.type}, ${info.size} bytes, mode ${data.mode}, modified ${data.mtime}${data.lines !== undefined ? `, ${data.lines} lines` : ""}`,
-    data,
-  };
+  const opened = await openVerifiedFile(policy, args.path, "read");
+  try {
+    const { info } = opened;
+    const data: Record<string, unknown> = {
+      path: opened.path, type: fileType(info), size: info.size,
+      mode: (info.mode & 0o7777).toString(8), mtime: info.mtime.toISOString(),
+    };
+    if (info.isFile() && info.size < MAX_INFO_TEXT_BYTES) {
+      const content = await opened.handle.readFile();
+      if (!isBinary(content)) data.lines = textLines(content.toString("utf8")).length;
+    }
+    return { ok: true, text: opened.path + ": " + data.type + ", " + info.size + " bytes, mode " + data.mode + ", modified " + data.mtime + (data.lines !== undefined ? ", " + data.lines + " lines" : ""), data };
+  } finally { await opened.handle.close(); }
 }
 
 async function searchFilesTool(
@@ -307,7 +305,28 @@ async function searchFilesTool(
   if (!options.forceJsSearch) {
     const rgResult = await searchWithRipgrep(root, args, maxResults);
     if (rgResult) {
-      return { ok: true, text: searchText(rgResult), data: { ...rgResult, engine: "ripgrep" } };
+      // Never return rg's path-read content: reopen and read through our own
+      // descriptor. A swap back from a symlink cannot preserve leaked rg text.
+      const matches: SearchMatch[] = [];
+      for (const match of rgResult.matches) {
+        let opened: VerifiedFile | undefined;
+        try {
+          const before = await lstat(match.path);
+          if (!before.isFile()) continue;
+          opened = await openVerifiedFile(policy, match.path, "read", before);
+          if (match.line === undefined) matches.push({ path: match.path });
+          else if (opened.info.size < MAX_SEARCH_TEXT_BYTES) {
+            const content = await opened.handle.readFile();
+            if (isBinary(content)) continue;
+            const line = textLines(content.toString("utf8"))[match.line - 1];
+            if (line !== undefined && contentRegex?.test(line)) matches.push({ path: match.path, line: match.line, text: line });
+          }
+        } catch (error) {
+          if (!(error instanceof PolicyError) && !["ENOENT", "ELOOP", "ENOTDIR"].includes(errorCode(error) ?? "")) throw error;
+        } finally { await opened?.handle.close(); }
+      }
+      const result = { matches, truncated: rgResult.truncated };
+      return { ok: true, text: searchText(result), data: { ...result, engine: "ripgrep" } };
     }
   }
 
@@ -440,7 +459,7 @@ async function searchWithJs(
   async function visit(directory: string): Promise<void> {
     if (matches.length > maxResults || traversalTruncated) return;
     const checkedDirectory = await checkedPath(policy, directory, "read");
-    const children = await readdir(checkedDirectory, { withFileTypes: true });
+    const children = await readVerifiedDirectory(policy, checkedDirectory);
     children.sort((left, right) => left.name.localeCompare(right.name));
 
     for (const child of children) {
@@ -455,6 +474,8 @@ async function searchWithJs(
       }
 
       const childPath = path.join(checkedDirectory, child.name);
+      try { await checkedPath(policy, childPath, "read"); }
+      catch (error) { if (error instanceof PolicyError) continue; throw error; }
       const childInfo = await lstat(childPath);
       if (childInfo.isSymbolicLink()) continue;
       if (childInfo.isDirectory()) {
@@ -468,11 +489,16 @@ async function searchWithJs(
       if (nameRegex && !nameRegex.test(nameToMatch)) continue;
 
       if (!contentRegex) {
-        matches.push({ path: childPath });
+        const opened = await openVerifiedFile(policy, childPath, "read", childInfo);
+        try { matches.push({ path: childPath }); }
+        finally { await opened.handle.close(); }
         continue;
       }
       if (childInfo.size >= MAX_SEARCH_TEXT_BYTES) continue;
-      const content = await readFile(childPath);
+      const opened = await openVerifiedFile(policy, childPath, "read", childInfo);
+      let content: Buffer;
+      try { content = await opened.handle.readFile(); }
+      finally { await opened.handle.close(); }
       if (isBinary(content)) continue;
       for (const [index, line] of textLines(content.toString("utf8")).entries()) {
         if (contentRegex.test(line)) matches.push({ path: childPath, line: index + 1, text: line });
@@ -562,7 +588,7 @@ async function createDirectoryTool(policy: Policy, args: Record<string, any>, op
   await options.testHooks?.afterInitialPathCheck?.({ tool: "create_directory", paths: [checked] });
   return await withMutationLock(async () => {
     const rechecked = await checkedPath(policy, args.path, "write");
-    await mkdir(rechecked, { recursive: true });
+    await createDirectoriesVerified(policy, rechecked);
     const finalPath = await checkedPath(policy, args.path, "write");
     return { ok: true, text: `directory ready: ${finalPath}`, data: { path: finalPath } };
   });
@@ -614,11 +640,13 @@ function changedPath(requested: string): PolicyError {
   return new PolicyError(`path changed while enforcing policy: ${requested}`);
 }
 
-async function openVerifiedFile(policy: Policy, requested: string, effect: "read" | "write"): Promise<VerifiedFile> {
+async function openVerifiedFile(policy: Policy, requested: string, effect: "read" | "write", expected?: Awaited<ReturnType<typeof lstat>>): Promise<VerifiedFile> {
   const checked = await checkedPath(policy, requested, effect);
+  const before = expected ?? await lstat(checked);
+  if (before.isSymbolicLink()) throw changedPath(requested);
   let handle: FileHandle;
   try {
-    handle = await open(checked, constants.O_RDONLY | constants.O_NOFOLLOW);
+    handle = await open(checked, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   } catch (error) {
     if (errorCode(error) === "ELOOP") throw changedPath(requested);
     throw error;
@@ -627,7 +655,7 @@ async function openVerifiedFile(policy: Policy, requested: string, effect: "read
     const info = await handle.stat();
     const rechecked = await checkedPath(policy, requested, effect);
     const current = await stat(rechecked);
-    if (!sameFile(info, current)) throw changedPath(requested);
+    if (!sameFile(info, before) || !sameFile(info, current)) throw changedPath(requested);
     return { handle, info, path: rechecked };
   } catch (error) {
     await handle.close();
@@ -635,8 +663,11 @@ async function openVerifiedFile(policy: Policy, requested: string, effect: "read
   }
 }
 
-async function openVerifiedDirectory(policy: Policy, requested: string): Promise<VerifiedDirectory> {
-  const checked = await checkedPath(policy, requested, "write");
+async function openVerifiedDirectory(policy: Policy, requested: string, effect: "read" | "write" = "write"): Promise<VerifiedDirectory> {
+  const checked = await checkedPath(policy, requested, effect);
+  const before = await lstat(checked);
+  if (before.isSymbolicLink()) throw changedPath(requested);
+  if (!before.isDirectory()) throw new ExpectedFailure("conflict", "path exists and is not a directory");
   let handle: FileHandle;
   try {
     handle = await open(checked, constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW);
@@ -644,8 +675,9 @@ async function openVerifiedDirectory(policy: Policy, requested: string): Promise
     if (errorCode(error) === "ELOOP") throw changedPath(requested);
     throw error;
   }
-  const directory = { handle, path: checked, policy, requested };
+  const directory = { handle, path: checked, policy, requested, effect };
   try {
+    if (!sameFile(before, await handle.stat())) throw changedPath(requested);
     await verifyDirectory(directory);
     return directory;
   } catch (error) {
@@ -655,17 +687,86 @@ async function openVerifiedDirectory(policy: Policy, requested: string): Promise
 }
 
 async function verifyDirectory(directory: VerifiedDirectory): Promise<void> {
-  const rechecked = await checkedPath(directory.policy, directory.requested, "write");
+  const rechecked = await checkedPath(directory.policy, directory.requested, directory.effect);
   const [opened, current] = await Promise.all([directory.handle.stat(), stat(rechecked)]);
   if (!sameFile(opened, current)) throw changedPath(directory.requested);
   directory.path = rechecked;
+}
+
+// Linux exposes directory descriptors as stable path anchors. Directory reads
+// elsewhere are bracketed with inode/policy rechecks (see SECURITY.md limits).
+function directoryAnchor(directory: VerifiedDirectory): string {
+  return process.platform === "linux" ? "/proc/self/fd/" + directory.handle.fd : directory.path;
+}
+
+async function readVerifiedDirectory(policy: Policy, requested: string) {
+  const directory = await openVerifiedDirectory(policy, requested, "read");
+  try {
+    const children = await readdir(directoryAnchor(directory), { withFileTypes: true });
+    await verifyDirectory(directory);
+    return children;
+  } finally { await directory.handle.close(); }
+}
+
+async function createDirectoriesVerified(policy: Policy, requested: string): Promise<void> {
+  const target = await checkedPath(policy, requested, "write");
+  const missing: string[] = [];
+  let ancestor = target;
+  for (;;) {
+    try { await lstat(ancestor); break; }
+    catch (error) {
+      if (errorCode(error) !== "ENOENT") throw error;
+      missing.unshift(path.basename(ancestor));
+      ancestor = path.dirname(ancestor);
+    }
+  }
+  let directory = await openVerifiedDirectory(policy, ancestor);
+  try {
+    for (const component of missing) {
+      await verifyDirectory(directory);
+      const logical = path.join(directory.path, component);
+      await checkedPath(policy, logical, "write");
+      try { await mkdirUnderDirectory(directory, component); }
+      catch (error) { if (errorCode(error) !== "EEXIST") throw error; }
+      await verifyDirectory(directory);
+      const info = await lstat(logical);
+      if (info.isSymbolicLink() || !info.isDirectory()) throw changedPath(logical);
+      const next = await openVerifiedDirectory(policy, logical);
+      await directory.handle.close();
+      directory = next;
+    }
+    await verifyDirectory(directory);
+  } finally { await directory.handle.close(); }
+}
+
+async function mkdirUnderDirectory(directory: VerifiedDirectory, component: string): Promise<void> {
+  if (process.platform === "linux") {
+    await mkdir(path.join(directoryAnchor(directory), component));
+    return;
+  }
+  // Node has no mkdirat API. Use the standard-library dir_fd operation on
+  // other POSIX hosts, inheriting just this directory as fd 3. Fail closed if
+  // Python is unavailable; never fall back to an unchecked pathname mkdir.
+  const program = "import os,sys\ntry: os.mkdir(sys.argv[1], dir_fd=3)\nexcept OSError as e: sys.exit(e.errno)";
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("python3", ["-I", "-c", program, component], {
+      stdio: ["ignore", "ignore", "ignore", directory.handle.fd],
+      timeout: 5_000,
+    });
+    child.once("error", () => reject(new ExpectedFailure("internal", "descriptor-relative directory creation requires python3 on this platform")));
+    child.once("close", (code) => {
+      if (code === 0) resolve();
+      else if (code === 17) reject(Object.assign(new Error("directory exists"), { code: "EEXIST" }));
+      else reject(new ExpectedFailure("internal", "descriptor-relative directory creation failed"));
+    });
+  });
 }
 
 async function checkedMutationTarget(policy: Policy, requested: string, createParent: boolean): Promise<MutationTarget> {
   const requestedParent = path.dirname(requested);
   if (createParent) {
     const checkedParent = await checkedPath(policy, requestedParent, "write");
-    await mkdir(checkedParent, { recursive: true });
+    await createDirectoriesVerified(policy, checkedParent);
   }
 
   const checked = await checkedPath(policy, requested, "write");

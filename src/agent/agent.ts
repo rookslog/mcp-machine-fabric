@@ -16,7 +16,7 @@ import { AGENT_TOOLS, findAgentTool } from "../shared/tools.js";
 import { VERSION } from "../version.js";
 import { runFsTool, type FsToolName } from "./fs-tools.js";
 import { JobManager, type JobReadResult, type JobRecord } from "./jobs.js";
-import { checkExec, checkPath, PolicyError, type Policy } from "./policy.js";
+import { checkExec, checkPath, isWithin, normalizePolicy, PolicyError, type Policy } from "./policy.js";
 import { ResultCache } from "./result-cache.js";
 
 const FS_TOOLS = new Set<string>([
@@ -36,6 +36,7 @@ export interface AgentOptions {
   token: string;
   policy: Policy;
   stateDir: string;
+  tokenFile?: string;
   capacity?: number;
   log?: (msg: string, extra?: Record<string, unknown>) => void;
   /** Finished jobs older than this are deleted from disk (default 7 days). */
@@ -73,10 +74,12 @@ export class Executor {
     stateDir: string,
     readonly capacity = 16,
   ) {
+    policy.deny_paths = [...(policy.deny_paths ?? []), nodePath.resolve(stateDir)];
     this.jobs = new JobManager({ stateDir: nodePath.join(stateDir, "jobs") });
   }
 
   async init(): Promise<void> {
+    Object.assign(this.policy, await normalizePolicy(this.policy));
     await this.jobs.init();
   }
 
@@ -189,6 +192,9 @@ export class Agent {
   private connectedResolvers: Array<() => void> = [];
 
   constructor(private opts: AgentOptions) {
+    if (opts.tokenFile) {
+      opts.policy.deny_paths = [...(opts.policy.deny_paths ?? []), nodePath.resolve(opts.tokenFile), nodePath.dirname(nodePath.resolve(opts.tokenFile))];
+    }
     this.executor = new Executor(opts.policy, opts.stateDir, opts.capacity);
     this.cache = new ResultCache(nodePath.join(opts.stateDir, "results"), this.startedAt);
     this.backoff = opts.minBackoffMs ?? 1000;
@@ -206,13 +212,17 @@ export class Agent {
       platform: process.platform,
       arch: process.arch,
       tools: AGENT_TOOLS.map((t) => t.name),
-      policy: { read_only: this.opts.policy.read_only, roots: this.opts.policy.roots, allow_exec: this.opts.policy.allow_exec },
+      policy: { read_only: this.opts.policy.read_only, roots: this.opts.policy.roots, allow_exec: this.opts.policy.allow_exec, deny_paths: this.opts.policy.deny_paths },
       started_at: this.startedAt,
       state_id: this.stateId,
     };
   }
 
   async start(): Promise<void> {
+    Object.assign(this.opts.policy, await normalizePolicy(this.opts.policy));
+    if (this.opts.policy.roots.some((root) => this.opts.policy.deny_paths?.some((denied) => isWithin(root, denied)))) {
+      this.log("WARNING: an allowed root contains private Machine Fabric paths; those paths remain denied");
+    }
     await mkdir(this.opts.stateDir, { recursive: true, mode: 0o700 });
     const idFile = nodePath.join(this.opts.stateDir, "state_id");
     this.stateId = (await readFile(idFile, "utf8").catch(() => "")).trim() || undefined;
