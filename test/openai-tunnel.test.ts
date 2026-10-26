@@ -8,8 +8,20 @@ import { afterEach, describe, expect, test } from "vitest";
 
 const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 const setupScript = path.join(repoRoot, "scripts", "setup-openai-tunnel.sh");
-const tunnelClient = spawnSync("bash", ["-lc", "command -v tunnel-client"], { encoding: "utf8" }).stdout.trim();
-const tunnelClientAvailable = tunnelClient.length > 0 && spawnSync(tunnelClient, ["--version"], { stdio: "ignore" }).status === 0;
+const stubClient = path.join(repoRoot, "test", "fixtures", "tunnel-client.mjs");
+const clients = [
+  { name: "stub 0.0.16", binary: stubClient, legacyOAuth404: false },
+  { name: "stub 0.0.9", binary: stubClient, legacyOAuth404: true },
+];
+if (process.env.MMF_TUNNEL_CLIENT_REAL === "1") {
+  const binary = process.env.TUNNEL_CLIENT_BIN || spawnSync("bash", ["-c", "command -v tunnel-client"], { encoding: "utf8" }).stdout.trim();
+  if (!binary) throw new Error("MMF_TUNNEL_CLIENT_REAL=1 requires tunnel-client on PATH or TUNNEL_CLIENT_BIN");
+  // Version lookup has an isolated HOME too; do not load the host's tunnel config.
+  const probeHome = path.join(process.env.TMPDIR || tmpdir(), "mmf-tunnel-version-home");
+  const version = spawnSync(binary, ["--version"], { encoding: "utf8", env: { PATH: process.env.PATH, HOME: probeHome } });
+  if (version.status !== 0) throw new Error(`Cannot execute real tunnel-client ${binary}: ${version.error?.message || version.stderr}`);
+  clients.push({ name: `real ${version.stdout.trim()}`, binary, legacyOAuth404: /^0\.0\.9(?:\+|\s|$)/.test(version.stdout) });
+}
 const realInstall = spawnSync("bash", ["-lc", "command -v install"], { encoding: "utf8" }).stdout.trim();
 const tempRoots = new Set<string>();
 const servers = new Set<Server>();
@@ -20,7 +32,7 @@ interface ScriptResult {
   stderr: string;
 }
 
-async function makeSandbox(): Promise<{ root: string; home: string; temp: string; runtimeEnv: string }> {
+async function makeSandbox() {
   const root = await mkdtemp(path.join(tmpdir(), "mmf-openai-tunnel-test-"));
   tempRoots.add(root);
   const home = path.join(root, "home");
@@ -29,21 +41,43 @@ async function makeSandbox(): Promise<{ root: string; home: string; temp: string
   await Promise.all([mkdir(home), mkdir(temp)]);
   await writeFile(runtimeEnv, "CONTROL_PLANE_API_KEY=dry-run-control-plane-key\n", { mode: 0o600 });
   await chmod(runtimeEnv, 0o600);
-  return { root, home, temp, runtimeEnv };
+  const mcpUrl = await startMcpServer(404);
+  return { root, home, temp, runtimeEnv, mcpUrl };
+}
+
+// Same helper as slice/auth-fixes; retain one copy when integrating the lanes.
+async function ephemeralHealthAddress(): Promise<string> {
+  const probe = createServer();
+  await new Promise<void>((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
+  });
+  const address = probe.address();
+  if (!address || typeof address === "string") throw new Error("expected an ephemeral health address");
+  const port = address.port;
+  await new Promise<void>((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+  return `127.0.0.1:${port}`;
 }
 
 async function runScript(
   args: string[],
   sandbox: Awaited<ReturnType<typeof makeSandbox>>,
   env: NodeJS.ProcessEnv = {},
+  tunnelClient = stubClient,
 ): Promise<ScriptResult> {
+  // Doctor binds this listener even during preflight. Do not contend with a
+  // live tunnel or another test using the production default health port.
+  if (!args.includes("--health")) args = [...args, "--health", await ephemeralHealthAddress()];
   return await new Promise((resolve, reject) => {
     const child = spawn("bash", [setupScript, ...args], {
       cwd: repoRoot,
       env: {
-        ...process.env,
+        PATH: process.env.PATH,
         HOME: sandbox.home,
         TMPDIR: sandbox.temp,
+        XDG_CONFIG_HOME: path.join(sandbox.home, ".config"),
+        CODEX_HOME: path.join(sandbox.home, ".codex"),
+        MMF_TUNNEL_MCP_URL: sandbox.mcpUrl,
         OPENAI_TUNNEL_RUNTIME_ENV: sandbox.runtimeEnv,
         TUNNEL_CLIENT_BIN: tunnelClient,
         ...env,
@@ -114,11 +148,14 @@ afterEach(async () => {
   tempRoots.clear();
 });
 
-describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
+describe.each(clients)("setup-openai-tunnel.sh ($name)", ({ binary: tunnelClient, legacyOAuth404 }) => {
+  const run = (args: string[], sandbox: Awaited<ReturnType<typeof makeSandbox>>, env: NodeJS.ProcessEnv = {}) =>
+    runScript(args, sandbox, { MMF_TEST_TUNNEL_CLIENT_LEGACY: tunnelClient === stubClient && legacyOAuth404 ? "1" : "0", ...env }, tunnelClient);
   test("dry-run writes an isolated PAT-header profile and unit preview without touching systemd", async () => {
     const sandbox = await makeSandbox();
-    const result = await runScript(
-      ["tunnel_0123456789abcdef", "--profile", "mmf-hub", "--health", "127.0.0.1:8082", "--dry-run"],
+    const health = await ephemeralHealthAddress();
+    const result = await run(
+      ["tunnel_0123456789abcdef", "--profile", "mmf-hub", "--health", health, "--dry-run"],
       sandbox,
     );
 
@@ -136,8 +173,8 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     const unitText = await readFile(unit, "utf8");
 
     expect(profileText).toContain('tunnel_id: "tunnel_0123456789abcdef"');
-    expect(profileText).toContain('listen_addr: "127.0.0.1:8082"');
-    expect(profileText).toContain('url: "http://127.0.0.1:8787/mcp"');
+    expect(profileText).toContain(`listen_addr: "${health}"`);
+    expect(profileText).toContain(`url: "${sandbox.mcpUrl}"`);
     expect(profileText).toContain(`Authorization: "file:${authHeader}"`);
     expect(profileText.match(/Authorization:/g)).toHaveLength(2);
     expect(await readFile(rawPat, "utf8")).toMatch(/^mmf_pat_dry_run_[A-Za-z0-9_-]+\n$/);
@@ -158,7 +195,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
 
   test("rejects unsafe profile names and the arXiv tunnel health port before writing", async () => {
     const badProfileSandbox = await makeSandbox();
-    const badProfile = await runScript(
+    const badProfile = await run(
       ["tunnel_0123456789abcdef", "--profile", "../escape", "--dry-run"],
       badProfileSandbox,
     );
@@ -168,7 +205,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     expect(await readFile(badProfileSandbox.runtimeEnv, "utf8")).toBe("CONTROL_PLANE_API_KEY=dry-run-control-plane-key\n");
 
     const protectedProfileSandbox = await makeSandbox();
-    const protectedProfile = await runScript(
+    const protectedProfile = await run(
       ["tunnel_0123456789abcdef", "--profile", "arxiv-local", "--dry-run"],
       protectedProfileSandbox,
     );
@@ -176,7 +213,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     expect(protectedProfile.stderr).toMatch(/arxiv-local.*reserved|reserved.*arxiv-local/i);
 
     const portSandbox = await makeSandbox();
-    const arxivPort = await runScript(
+    const arxivPort = await run(
       ["tunnel_0123456789abcdef", "--health", "127.0.0.1:8080", "--dry-run"],
       portSandbox,
     );
@@ -187,12 +224,12 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
 
   test("requires exactly one tunnel id and rejects unknown options", async () => {
     const missingSandbox = await makeSandbox();
-    const missing = await runScript(["--dry-run"], missingSandbox);
+    const missing = await run(["--dry-run"], missingSandbox);
     expect(missing.code).toBe(2);
     expect(missing.stderr).toContain("Usage:");
 
     const unknownSandbox = await makeSandbox();
-    const unknown = await runScript(["tunnel_0123456789abcdef", "--wat"], unknownSandbox);
+    const unknown = await run(["tunnel_0123456789abcdef", "--wat"], unknownSandbox);
     expect(unknown.code).toBe(2);
     expect(unknown.stderr).toMatch(/unknown option/i);
   });
@@ -202,7 +239,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     const sentinel = path.join(sandbox.root, "executed");
     await writeFile(sandbox.runtimeEnv, `CONTROL_PLANE_API_KEY=$(touch ${sentinel})\n`, { mode: 0o600 });
 
-    const result = await runScript(["tunnel_0123456789abcdef", "--dry-run"], sandbox);
+    const result = await run(["tunnel_0123456789abcdef", "--dry-run"], sandbox);
 
     expect(result.code).toBe(0);
     await expect(access(sentinel)).rejects.toMatchObject({ code: "ENOENT" });
@@ -225,7 +262,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     ]);
     const missingRuntimeEnv = path.join(sandbox.root, "missing-runtime.env");
 
-    const result = await runScript(
+    const result = await run(
       ["tunnel_0123456789abcdef0123456789abcdef"],
       sandbox,
       { OPENAI_TUNNEL_RUNTIME_ENV: missingRuntimeEnv },
@@ -247,7 +284,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     await symlink(tunnelClient, spacedTunnelClient);
     await writeFile(spacedRuntimeEnv, "CONTROL_PLANE_API_KEY=dry-run-control-plane-key\n", { mode: 0o600 });
 
-    const result = await runScript(
+    const result = await run(
       ["tunnel_0123456789abcdef", "--dry-run"],
       sandbox,
       { TUNNEL_CLIENT_BIN: spacedTunnelClient, OPENAI_TUNNEL_RUNTIME_ENV: spacedRuntimeEnv },
@@ -264,11 +301,11 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
 
   test("a valid dry-run reaches doctor target and header checks", async () => {
     const sandbox = await makeSandbox();
-    const result = await runScript(["tunnel_0123456789abcdef0123456789abcdef", "--dry-run"], sandbox);
+    const result = await run(["tunnel_0123456789abcdef0123456789abcdef", "--dry-run"], sandbox);
 
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("CHECK tunnel_id                PASS");
-    expect(result.stdout).toContain("CHECK mcp_target               PASS http://127.0.0.1:8787/mcp");
+    expect(result.stdout).toContain(`CHECK mcp_target               PASS ${sandbox.mcpUrl}`);
     expect(result.stdout + result.stderr).not.toContain("mmf_pat_dry_run");
     const artifactDir = result.stdout.match(/^Dry-run artifact directory: (.+)$/m)?.[1];
     const profile = await readFile(path.join(artifactDir!, "profiles", "mmf-hub.yaml"), "utf8");
@@ -281,14 +318,18 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     const mcpUrl = await startMcpServer(404);
     const pat = await seedExistingPat(sandbox);
 
-    const result = await runScript(
+    const result = await run(
       ["tunnel_0123456789abcdef0123456789abcdef"],
       sandbox,
       { MMF_TUNNEL_MCP_URL: mcpUrl },
     );
 
-    expect(result.code).toBe(0);
-    expect(result.stderr).toContain("expected HTTP 404 OAuth-metadata absence");
+    expect(result.code, result.stdout + result.stderr).toBe(0);
+    if (legacyOAuth404) {
+      expect(result.stderr).toContain("expected HTTP 404 OAuth-metadata absence");
+    } else {
+      expect(result.stdout).toContain("CHECK oauth_metadata           PASS OAuth metadata not advertised; all candidates returned HTTP 404");
+    }
     const profile = await readFile(path.join(sandbox.home, ".config", "tunnel-client", "mmf-hub.yaml"), "utf8");
     expect(profile).toContain(`url: "${mcpUrl}"`);
     expect(await readFile(path.join(sandbox.home, ".config", "mmf", "pat-openai-tunnel.authorization"), "utf8")).toBe(
@@ -302,7 +343,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     const mcpUrl = await startMcpServer(500);
     await seedExistingPat(sandbox);
 
-    const result = await runScript(
+    const result = await run(
       ["tunnel_0123456789abcdef0123456789abcdef"],
       sandbox,
       { MMF_TUNNEL_MCP_URL: mcpUrl },
@@ -311,6 +352,47 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     expect(result.code).not.toBe(0);
     await expect(access(path.join(sandbox.home, ".config", "tunnel-client", "mmf-hub.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
     await expect(access(path.join(sandbox.home, ".config", "systemd", "user", "mmf-openai-tunnel.service"))).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(access(path.join(sandbox.home, ".config", "mmf", "pat-openai-tunnel.authorization"))).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  test("production treats the external EnvironmentFile as data and never executes it", async () => {
+    const sandbox = await makeSandbox();
+    await seedExistingPat(sandbox);
+    const sentinel = path.join(sandbox.root, "executed");
+    await writeFile(sandbox.runtimeEnv, `CONTROL_PLANE_API_KEY=$(touch ${sentinel})\n`, { mode: 0o600 });
+
+    const result = await run(["tunnel_0123456789abcdef0123456789abcdef"], sandbox);
+
+    await expect(access(sentinel)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(await readFile(sandbox.runtimeEnv, "utf8")).toBe(`CONTROL_PLANE_API_KEY=$(touch ${sentinel})\n`);
+    if (legacyOAuth404) {
+      expect(result.code, result.stdout + result.stderr).toBe(0);
+    } else {
+      expect(result.code, result.stdout + result.stderr).toBe(2);
+      expect(result.stdout).toMatch(/CHECK control_plane_api_key\s+FAIL control plane API key is malformed/);
+      await expect(access(path.join(sandbox.home, ".config", "tunnel-client", "mmf-hub.yaml"))).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  test("an occupied health port rejects preflight and preserves existing managed files", async () => {
+    const sandbox = await makeSandbox();
+    await seedExistingPat(sandbox);
+    const profile = path.join(sandbox.home, ".config", "tunnel-client", "mmf-hub.yaml");
+    const unit = path.join(sandbox.home, ".config", "systemd", "user", "mmf-openai-tunnel.service");
+    await Promise.all([mkdir(path.dirname(profile), { recursive: true }), mkdir(path.dirname(unit), { recursive: true })]);
+    const oldProfile = "# Managed by setup-openai-tunnel.sh\nold-profile\n";
+    const oldUnit = "# Managed by setup-openai-tunnel.sh\nold-unit\n";
+    await Promise.all([writeFile(profile, oldProfile), writeFile(unit, oldUnit)]);
+
+    // Hold a fixture-owned ephemeral port throughout doctor; never probe a host service.
+    const result = await run(
+      ["tunnel_0123456789abcdef0123456789abcdef", "--health", new URL(sandbox.mcpUrl).host], sandbox,
+    );
+
+    expect(result.code, result.stdout + result.stderr).toBe(2);
+    expect(result.stdout).toMatch(/CHECK health_listener\s+FAIL .*address already in use|CHECK health_listener\s+FAIL .*EADDRINUSE/);
+    expect(await readFile(profile, "utf8")).toBe(oldProfile);
+    expect(await readFile(unit, "utf8")).toBe(oldUnit);
     await expect(access(path.join(sandbox.home, ".config", "mmf", "pat-openai-tunnel.authorization"))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
@@ -332,21 +414,23 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     ]);
     const installWrapper = path.join(sandbox.root, "install-with-failures.sh");
     const installState = path.join(sandbox.root, "install-state");
+    const restorationLog = path.join(sandbox.root, "restorations");
     await writeFile(
       installWrapper,
-      `#!/usr/bin/env bash\nset -eu\nsrc="\${@: -2:1}"\ndst="\${@: -1}"\nif [[ "$dst" == *mmf-openai-tunnel.service && "$src" != */backups/* ]]; then exit 73; fi\nif [[ "$src" == */backups/0 ]]; then printf failed > "${installState}"; exit 74; fi\nexec "${realInstall}" "$@"\n`,
+      `#!/usr/bin/env bash\nset -eu\nsrc="\${@: -2:1}"\ndst="\${@: -1}"\nif [[ "$src" == */backups/* ]]; then printf '%s\\n' "\${src##*/}" >> "${restorationLog}"; fi\nif [[ "$dst" == *mmf-openai-tunnel.service && "$src" != */backups/* ]]; then exit 73; fi\nif [[ "$src" == */backups/0 ]]; then printf failed > "${installState}"; exit 74; fi\nexec "${realInstall}" "$@"\n`,
       { mode: 0o700 },
     );
     await chmod(installWrapper, 0o700);
 
-    const result = await runScript(
+    const result = await run(
       ["tunnel_0123456789abcdef0123456789abcdef"],
       sandbox,
       { MMF_TUNNEL_MCP_URL: mcpUrl, MMF_TUNNEL_INSTALL_BIN: installWrapper },
     );
 
-    expect(result.code).not.toBe(0);
+    expect(result.code, result.stdout + result.stderr).toBe(1);
     expect(await readFile(installState, "utf8")).toBe("failed");
+    expect(await readFile(restorationLog, "utf8")).toBe("0\n1\n2\n3\n");
     expect(await readFile(path.join(profileDir, "mmf-hub.yaml"), "utf8")).toBe(oldProfile);
     expect(await readFile(path.join(unitDir, "mmf-openai-tunnel.service"), "utf8")).toBe(oldUnit);
     expect(await readFile(path.join(patDir, "pat-openai-tunnel.authorization"), "utf8")).toBe(oldAuth);

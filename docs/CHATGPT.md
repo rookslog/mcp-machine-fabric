@@ -1,6 +1,6 @@
 # ChatGPT connectivity
 
-Status as of 2026-10-08: the OpenAI tunnel route is prepared and dry-run tested. Creating the OpenAI-hosted tunnel and attaching it to a ChatGPT app remain owner actions. The public HTTPS route is documented but has not been enabled.
+Status as of 2026-10-25: the OpenAI tunnel setup is locally qualified with `tunnel-client` 0.0.9 and 0.0.16 using isolated profiles, fake credentials, and loopback fixtures. Creating the OpenAI-hosted tunnel and attaching it to a ChatGPT app remain owner actions. The public HTTPS route is documented but has not been enabled.
 
 ## Choose a route
 
@@ -9,7 +9,7 @@ Status as of 2026-10-08: the OpenAI tunnel route is prepared and dry-run tested.
 | A. OpenAI Secure MCP Tunnel | No public inbound listener; tunnel-client makes outbound connections | **No authentication** in ChatGPT; tunnel-client injects a local MMF PAT | Prefer when the hub should remain private |
 | B. Tailscale Funnel | Public HTTPS endpoint on port 8443 | Hub OAuth with owner consent | Use only when a public endpoint is acceptable |
 
-Route A is preferred when the hub should remain private. `tunnel-client` 0.0.9 supports `mcp.extra_headers` and `mcp.discovery_extra_headers`, including `file:` secret references. The setup script stores the raw PAT separately from the complete `Bearer …` header value and references the latter from the profile. The connector must use **No authentication**: tunnel-client applies connector-supplied headers after static headers, so a forwarded `Authorization` header would override the injected PAT.
+Route A is preferred when the hub should remain private. Both qualified `tunnel-client` versions support `mcp.extra_headers` and `mcp.discovery_extra_headers`, including `file:` secret references. The setup script stores the raw PAT separately from the complete `Bearer …` header value and references the latter from the profile. The connector must use **No authentication**: tunnel-client applies connector-supplied headers after static headers, so a forwarded `Authorization` header would override the injected PAT.
 
 The tunnel runtime's `CONTROL_PLANE_API_KEY` authenticates tunnel-client to OpenAI. It does not authenticate requests to the MMF hub. An `OPENAI_ADMIN_KEY` is needed only for programmatic tunnel CRUD and is not installed in the service.
 
@@ -18,8 +18,8 @@ The tunnel runtime's `CONTROL_PLANE_API_KEY` authenticates tunnel-client to Open
 ### Owner prerequisites
 
 1. Use a Linux host with systemd user services that can reach the loopback MMF hub and make outbound HTTPS connections to OpenAI. This repository does not provide a macOS tunnel-service installer.
-2. Install `tunnel-client` 0.0.9 from the download in [Platform Tunnels](https://platform.openai.com/settings/organization/tunnels) or the latest public release linked by the official [Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), and confirm `tunnel-client --version`.
-3. In Platform Tunnels, create the tunnel object and copy its `tunnel_…` ID. The installed client requires 32 lowercase letters or digits after `tunnel_`.
+2. Install a supported `tunnel-client` from the download in [Platform Tunnels](https://platform.openai.com/settings/organization/tunnels) or a public release linked by the official [Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels), and confirm `tunnel-client --version`. This setup requires at least 0.0.9; the locally qualified versions are 0.0.9 and 0.0.16. Intermediate and later versions have not been exercised here. To use a separate installed binary, set `TUNNEL_CLIENT_BIN=/absolute/path/to/tunnel-client` for setup; that executable path is also written into the unit.
+3. In Platform Tunnels, create the tunnel object and copy its `tunnel_…` ID. This setup accepts the legacy format with 32 lowercase letters or digits after `tunnel_`; namespaced IDs supported by newer clients are not accepted by this wrapper.
 4. Create or obtain a runtime API key whose principal has **Tunnels Read + Use** for that tunnel. Store it in a private environment file as exactly one `CONTROL_PLANE_API_KEY=…` assignment. Do not put the key on the command line.
 5. Associate the tunnel with the intended ChatGPT workspace as well as its Platform organization. An organization-only association does not automatically make it visible in a workspace.
 6. Ensure the person creating the ChatGPT plugin has **Tunnels Read + Use** and workspace permission to add a custom MCP server.
@@ -55,7 +55,9 @@ The script:
 - validates a temporary candidate bundle before installing it, backs up existing managed files, and restores them if installation fails;
 - runs `tunnel-client doctor --profile mmf-hub --explain` against that candidate.
 
-When the local hub has no OAuth metadata, doctor reports `oauth_metadata` as failed even when the profile, runtime key reference, MCP target, local reachability, health listener, and UI checks pass. The script reads doctor’s JSON report and accepts only the sole failure `oauth_metadata` with the exact expected HTTP 404 from the loopback protected-resource URL. A timeout, 5xx, different URL, or additional failed check reported by doctor stops setup. A hub that does publish metadata can pass the check. The installed doctor treats a 2xx metadata response as reachable; it does not validate the response body’s OAuth semantics.
+Doctor binds the configured health address during preflight. If `127.0.0.1:8082` is occupied, choose another unused loopback port, for example `--health 127.0.0.1:18082`, and use that port for the health/readiness commands below. Do not stop an unrelated service to free the port. Port 8080 remains reserved for arXiv. If updating an existing MMF tunnel whose own listener occupies the selected port, deliberately stop only `mmf-openai-tunnel.service` before setup, then start it after installation.
+
+When the local hub has no OAuth metadata, 0.0.9 doctor reports `oauth_metadata` as failed even when the profile, runtime key reference, MCP target, local reachability, health listener, and UI checks pass. The script reads doctor’s JSON report and accepts only the sole failure `oauth_metadata` with the exact expected HTTP 404 from the loopback protected-resource URL. With 0.0.16, all metadata candidates returning 404 is a native PASS and doctor exits 0; no compatibility warning is needed. A timeout, 5xx, different URL, or additional failed check reported by doctor stops setup. In particular, OAuth absence never excuses a failed health bind. Doctor is a local preflight, not an authenticated MCP call or a check that the runtime key can poll OpenAI. See the upstream [configuration reference](https://github.com/openai/tunnel-client/blob/master/docs/configuration.md) and [authorization troubleshooting](https://github.com/openai/tunnel-client/blob/master/docs/troubleshooting.md#authorization-failures-identify-the-failing-surface-first).
 
 ### Verify the local runtime
 
@@ -90,6 +92,19 @@ Keep `mmf-openai-tunnel.service` running during discovery and every later MCP ca
 If the tunnel is absent from the selector, check its ChatGPT-workspace association and the plugin creator’s Tunnels Read + Use permissions before changing local configuration. UI labels can change; the official [Secure MCP Tunnel guide](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) is controlling.
 
 Observed locally: the script and doctor configuration path work. Not yet verified: a real OpenAI tunnel poll, `/readyz` from the running MMF tunnel daemon, ChatGPT tool discovery, or a ChatGPT-originated MCP call. Those require the owner-created tunnel object.
+
+### Run the isolated setup tests
+
+The default test uses doctor stubs for the 0.0.16 and legacy 0.0.9 contracts, so it runs even when `tunnel-client` is absent. Opt in to an additional pass against the installed binary, or select another existing binary explicitly:
+
+```bash
+npx vitest run test/openai-tunnel.test.ts
+MMF_TUNNEL_CLIENT_REAL=1 npx vitest run test/openai-tunnel.test.ts
+MMF_TUNNEL_CLIENT_REAL=1 TUNNEL_CLIENT_BIN=/absolute/path/to/tunnel-client-0.0.16 \
+  npx vitest run test/openai-tunnel.test.ts
+```
+
+Real mode fails explicitly if the selected binary is unavailable. All setup invocations use temporary HOME/config directories, fake IDs and keys, fixture MCP servers, and independently allocated health ports; they never run a daemon or poll OpenAI. An additional test holds a fixture health port open to ensure preflight refuses the conflict and preserves managed files.
 
 ### Rotate or remove the PAT
 

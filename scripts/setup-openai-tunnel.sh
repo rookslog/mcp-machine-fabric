@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Minimum supported tunnel-client: 0.0.9. Locally qualified with 0.0.9 and 0.0.16.
+# 0.0.9 doctor fails on absent OAuth metadata; 0.0.16 accepts all-404 absence.
 PROFILE="mmf-hub"
 HEALTH_ADDR="127.0.0.1:8082"
 DRY_RUN=0
@@ -13,6 +15,9 @@ Usage: setup-openai-tunnel.sh TUNNEL_ID [--profile mmf-hub] [--health 127.0.0.1:
 Creates an OpenAI Secure MCP Tunnel profile for the local MCP Machine Fabric
 hub at http://127.0.0.1:8787/mcp. The OpenAI-hosted tunnel object and runtime
 API key must already exist.
+
+Supported tunnel-client versions: 0.0.9 and 0.0.16 (minimum 0.0.9).
+Choose an unused loopback health port with --health if 8082 is occupied.
 
 --dry-run writes an isolated profile and systemd-unit preview under a temporary
 directory. It never creates a real MMF PAT and never writes under ~/.config.
@@ -66,7 +71,7 @@ done
 [[ -n "$TUNNEL_ID" ]] || die_usage "TUNNEL_ID is required"
 [[ "$TUNNEL_ID" =~ ^tunnel_[a-z0-9]+$ ]] || die_usage "Invalid tunnel id format"
 if [[ "$DRY_RUN" -eq 0 && ! "$TUNNEL_ID" =~ ^tunnel_[a-z0-9]{32}$ ]]; then
-  die_usage "Invalid tunnel id: tunnel-client 0.0.9 requires tunnel_ followed by 32 lowercase letters or digits"
+  die_usage "Invalid tunnel id: expected tunnel_ followed by 32 lowercase letters or digits"
 fi
 [[ "$PROFILE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]] || die_usage "Invalid profile name"
 [[ "$PROFILE" != "arxiv-local" ]] || die_usage "Profile arxiv-local is reserved for the unrelated arXiv tunnel"

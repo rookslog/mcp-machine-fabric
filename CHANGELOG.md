@@ -2,6 +2,24 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Isolate OpenAI tunnel setup tests from host health port 8082 and the live MCP
+  endpoint; an occupied health port must still fail preflight and preserve files.
+- Run tunnel setup tests with deterministic doctor stubs by default, with
+  `MMF_TUNNEL_CLIENT_REAL=1` adding an installed-client pass and
+  `TUNNEL_CLIENT_BIN` selecting a separate executable. Retain both 0.0.9's narrow
+  OAuth-404 exception and 0.0.16's native acceptance of absent OAuth metadata.
+- Exercise production EnvironmentFile parsing as data and record every rollback
+  restoration attempt, including those after an injected restoration failure.
+
+### Documentation
+
+- State the minimum tunnel-client version (0.0.9), locally qualified versions
+  (0.0.9 and 0.0.16), and owner steps for a conflicting health port.
+
 ## 0.1.0 - 2026-10-08
 
 ### Added
