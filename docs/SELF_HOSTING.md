@@ -262,34 +262,113 @@ Install the `sqlite3` command-line client, then use its online backup command
 for a consistent snapshot:
 
 ```bash
+umask 077
 mkdir -p backups
-sqlite3 ~/.local/share/mmf-hub/hub.db ".backup 'backups/hub-$(date +%F).db'"
+sqlite3 "${MMF_DATA_DIR:-$HOME/.local/share/mmf-hub}/hub.db" ".backup 'backups/hub-$(date +%F).db'"
 ```
 
 For Docker, run the same command against `/data/hub.db` from a maintenance
-container that mounts `mmf-data`. The backup and restore commands were not
-exercised during the packaging check.
+container that mounts `mmf-data`. The `sqlite3` CLI is a prerequisite; if it
+is missing, install it through your OS package manager before proceeding.
+The automated SQLite cases skip explicitly when this CLI is unavailable.
 
-Before a restore, stop the hub and copy the current data directory to a safe
-location. Restore the selected database as `hub.db`, keep it owned by the hub
-user, and then start the hub. Confirm `/readyz`, `mmf status`, enrolled devices,
-and recent requests before deleting the pre-restore copy.
+The source backup/restore commands were exercised on Linux with a temporary
+HOME, a source-installed hub and agent, and SQLite CLI 3.36.0. Both graceful
+and crash-stop restores recovered the snapshot's devices, PATs and request
+rows; a PAT created after backup was rejected after restore. The Docker
+maintenance-container path remains unexercised.
+
+Before a restore, stop the hub and agents, and close other database clients.
+For a systemd hub, use `systemctl --user stop mmf-hub.service`; stop agents
+with their own service managers. Keep them stopped for the commands below.
+Run as the hub user, with `MMF_DATA_DIR` set if you use a nondefault directory.
+Set the shell variable `backup` to the selected backup's absolute path first.
+Keep backups outside the live data directory.
+
+```bash
+(
+set -eu
+: "${backup:?set backup to the selected absolute backup path}"
+umask 077
+data="${MMF_DATA_DIR:-$HOME/.local/share/mmf-hub}"
+pre_restore=$(mktemp -d "${data}.pre-restore.XXXXXX")
+cp -a "$data/." "$pre_restore/"
+# WAL/SHM belong to the old database, never to the restored snapshot.
+rm -f "$data/hub.db" "$data/hub.db-wal" "$data/hub.db-shm"
+cp "$backup" "$data/hub.db"
+chmod 600 "$data/hub.db"
+printf 'Pre-restore data retained at %s\n' "$pre_restore"
+)
+```
+
+The subshell stops on errors, including a failed pre-restore copy, before
+removing the original database.
+
+The hub uses SQLite WAL mode. A graceful shutdown normally removes `-wal`
+and `-shm`; a crash can leave both. Preserve the whole stopped data directory
+first, then remove the old database and both sidecars before copying the
+snapshot. Never delete sidecars while the hub or another database client is
+using them. If the copy fails, keep services stopped and recover from the
+pre-restore directory.
+
+Start the hub and agents. Confirm `/healthz`, `/readyz`, `mmf status`, enrolled
+devices, personal access tokens and recent requests before deleting the
+pre-restore copy. Tokens created after the snapshot should no longer
+authenticate. Device `last_seen` values and the request ledger will advance
+again when agents reconnect and checks run. A snapshot stores token hashes,
+not the original secrets: retain the backed-up devices' and clients' private
+token files separately. Restrict access to the backup and pre-restore copy.
 
 ## Upgrade and roll back
 
 For a source installation, fetch and check out the intended release. Then run
 `./scripts/install-release.sh`. The script creates an immutable release
 directory and changes `~/.local/opt/mcp-machine-fabric/current` to point to it.
-Restart the hub and agents after the link changes.
+It prints `previous current:` before building. Clean releases use
+`<version>-<sha>`; dirty builds append `-dirty-<source-content-sha256>`, including
+tracked and untracked nonignored source contents and modes. A reinstall builds
+a candidate and compares all installed files, modes and symlinks (including
+dependencies). It reuses a matching directory without replacing it, or fails
+without modifying a differing release. An existing `current` must be a symlink.
+Failed builds leave existing releases and `current` untouched. Do not edit
+release directories; choose another commit if a candidate differs. If an
+interrupted installer leaves `.install-lock`, confirm no installer is running
+before removing that empty lock directory.
+
+Restart the hub and agents after the link changes. Releases include code and
+dependencies, not hub data, agent state or private configuration.
 
 Record the old link target before an upgrade:
 
 ```bash
-readlink ~/.local/opt/mcp-machine-fabric/current
+previous=$(readlink ~/.local/opt/mcp-machine-fabric/current)
+printf 'Previous release: %s\n' "$previous"
 ```
 
-To roll back, repoint `current` to that recorded release directory and restart
-the services. This rollback path was not exercised during the packaging check.
+To roll back, stop the hub and agents first. Set `previous` to that recorded
+release directory if you are using a new shell, then repoint `current`:
+
+```bash
+(
+set -eu
+: "${previous:?set previous to the recorded release directory}"
+test -d "$previous"
+ln -sfn "$previous" "$HOME/.local/opt/mcp-machine-fabric/current"
+)
+```
+
+Restart the hub and agents using their service managers. Repoint each
+machine's own link when agents are on separate hosts. Back up the database
+before upgrading: a code rollback does not undo schema or data changes. If
+the previous release cannot read the upgraded database, keep services stopped
+and use a compatible pre-upgrade snapshot via the restore procedure above.
+
+The source X → Y → X release sequence was exercised on Linux in an isolated
+HOME, including reinstalling X while its hub and agent ran, then restarting
+both processes after upgrade and rollback. `/healthz`, `/readyz`, `mmf status`
+and a PAT-authenticated `read_file` MCP call passed after each restart. This
+exercise did not activate systemd/launchd units, run on macOS, or test a schema
+change; those boundaries are separate from the source-process checks.
 
 For Docker, build each release with a unique tag. Stop and replace the hub
 container while keeping the `mmf-data` volume. To roll back, recreate the

@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Release installs preserve existing directories, verify complete candidate
+  contents before reuse, identify dirty source contents in release names, and
+  print the previous `current` target. Unique staging and an installer lock
+  protect failed and concurrent installs; symlink changes support Linux and
+  stock macOS bash 3.2 without GNU `mv` flags.
+
+### Documentation
+
+- Exercised source SQLite backup/restore after graceful and crash stops, and
+  source release upgrade/rollback, with a real isolated hub and agent on Linux.
+  Added executable restore/rollback commands, WAL sidecar handling, private
+  backup permissions, and automated procedure tests with explicit missing-CLI
+  skips. Service-manager, Docker restore, macOS runtime and schema-change
+  rollback remain outside this exercise.
+
 ## 0.1.0 - 2026-10-08
 
 ### Added
