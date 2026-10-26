@@ -9,6 +9,7 @@ import { runDoctor } from "./doctor.js";
 import { createOAuthRouter, FabricOAuthProvider, SCOPES } from "./hub/oauth.js";
 import { createHub, jsonLogger } from "./hub/server.js";
 import { HubStore } from "./hub/store.js";
+import { readConfirmedPassphrase } from "./secret-input.js";
 import { VERSION } from "./version.js";
 
 const USAGE = `mcp-machine-fabric ${VERSION}
@@ -108,10 +109,10 @@ async function main(argv: string[]): Promise<number> {
     case "passphrase": {
       const pub = publicUrl(undefined, 8787);
       const { store, provider } = openProvider(dataDir(), pub);
-      if (process.stdin.isTTY) process.stderr.write("Enter new owner passphrase (min 12 chars), then Ctrl-D: ");
-      const pass = await readStdin();
-      provider.setOwnerPassphrase(pass);
-      store.close();
+      try {
+        const pass = process.stdin.isTTY ? await readConfirmedPassphrase() : await readStdin();
+        provider.setOwnerPassphrase(pass);
+      } finally { store.close(); }
       console.log("Owner passphrase set.");
       return 0;
     }
@@ -152,7 +153,7 @@ async function main(argv: string[]): Promise<number> {
       const { store, provider } = openProvider(dataDir(), pub);
       try {
         if (sub === "create" && positionals[0]) {
-          const scopes = values.scopes ? values.scopes.split(",").map((s) => s.trim()) : [...SCOPES];
+          const scopes = values.scopes !== undefined ? values.scopes.split(",").map((s) => s.trim()) : [...SCOPES];
           const requestedMachines = values.machines?.split(",").map((machine) => machine.trim()).filter(Boolean);
           if (values.machines !== undefined && requestedMachines?.length === 0) {
             throw new Error("--machines must name at least one enrolled machine");
@@ -205,7 +206,7 @@ async function main(argv: string[]): Promise<number> {
       const log = jsonLogger("agent");
       const stateDir = values["state-dir"] ?? process.env.MMF_STATE_DIR ?? nodePath.join(homedir(), ".local/state/mmf-agent");
       const retentionDays = Number(process.env.MMF_JOB_RETENTION_DAYS ?? 7);
-      const agent = new Agent({ hubUrl, token, policy, stateDir, log, jobRetentionMs: Math.max(0.01, retentionDays) * 24 * 3600 * 1000 });
+      const agent = new Agent({ hubUrl, token, policy, stateDir, tokenFile: values["token-file"], log, jobRetentionMs: Math.max(0.01, retentionDays) * 24 * 3600 * 1000 });
       await agent.start();
       log("agent started", { hub: hubUrl, policy, state_dir: stateDir });
       const shutdown = async (sig: string) => {

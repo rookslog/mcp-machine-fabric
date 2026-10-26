@@ -160,7 +160,7 @@ export function createMcpServer(ctx: McpContext, caller: CallerInfo): McpServer 
       const allowed = new Set(machines);
       const health = ctx.registry.allHealth().filter((machine) => allowed.has(machine.machine));
       const lines = health.map((h) => {
-        const pol = h.agent ? ` roots=${h.agent.policy.roots.join(",")}${h.agent.policy.read_only ? " READ-ONLY" : ""}${h.agent.policy.allow_exec ? "" : " no-exec"}` : "";
+        const pol = h.agent ? ` roots=${h.agent.policy.roots.join(",")} denied=${(h.agent.policy.deny_paths ?? []).join(",")}${h.agent.policy.read_only ? " READ-ONLY" : ""}${h.agent.policy.allow_exec ? "" : " no-exec"}` : "";
         const where = h.agent ? ` ${h.agent.platform}/${h.agent.arch} host=${h.agent.hostname}` : "";
         return `${h.machine}: ${h.ready ? "READY" : `NOT READY (${h.reason})`}${where}${h.heartbeat_rtt_ms !== null ? ` rtt=${h.heartbeat_rtt_ms}ms` : ""}${pol}`;
       });

@@ -266,8 +266,8 @@ describe("owner credentials and personal access tokens", () => {
     const harness = await createHarness();
 
     expect(harness.provider.hasOwnerPassphrase()).toBe(true);
-    expect(harness.provider.verifyOwnerPassphrase(OWNER_PASSPHRASE)).toBe(true);
-    expect(harness.provider.verifyOwnerPassphrase("incorrect phrase")).toBe(false);
+    expect(await harness.provider.verifyOwnerPassphrase(OWNER_PASSPHRASE)).toBe(true);
+    expect(await harness.provider.verifyOwnerPassphrase("incorrect phrase")).toBe(false);
     expect(() => harness.provider.setOwnerPassphrase("too short")).toThrow(/12/);
 
     const stored = harness.db
@@ -279,10 +279,8 @@ describe("owner credentials and personal access tokens", () => {
 
   test("creates, verifies, lists, and revokes hashed personal access tokens", async () => {
     const harness = await createHarness();
-    const created = harness.provider.createPersonalToken("automation", [
-      "fabric:read",
-      "not-a-scope",
-    ]);
+    expect(() => harness.provider.createPersonalToken("invalid", ["fabric:read", "not-a-scope"])).toThrow();
+    const created = harness.provider.createPersonalToken("automation", ["fabric:read"]);
 
     expect(created.id).toEqual(expect.any(String));
     expect(created.token).toMatch(/^mmf_pat_[A-Za-z0-9_-]+$/);

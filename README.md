@@ -59,7 +59,11 @@ Tools carry MCP annotations (`readOnlyHint`, `destructiveHint`,
 
 ## Quick start
 
-Requires Node.js ≥ 22.13 on the hub and on each agent machine.
+Requires Node.js ≥ 22.13 on the hub and on each agent machine. On non-Linux
+POSIX agents (including macOS), creating directories or missing parent
+directories also requires `python3` for its standard-library descriptor-relative
+mkdir operation. Those operations fail closed if Python is unavailable. See
+[SECURITY.md](SECURITY.md) for path-policy and local-writer limits.
 
 ```bash
 git clone https://github.com/rookslog/mcp-machine-fabric && cd mcp-machine-fabric

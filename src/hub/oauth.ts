@@ -2,8 +2,10 @@ import {
   createHash,
   randomBytes,
   scryptSync,
+  scrypt,
   timingSafeEqual,
 } from "node:crypto";
+import { isIP } from "node:net";
 import type { DatabaseSync } from "node:sqlite";
 import express, { type Response, type Router } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
@@ -137,6 +139,21 @@ function normalizeScopes(scopes: readonly string[]): string[] {
   return [...fabric, ...machines];
 }
 
+// Canonicalize IPv6 spellings before grouping the first 64 network bits.
+function approvalClientKey(address: string): string {
+  if (isIP(address) !== 6) return address;
+  const canonical = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  const [left, right] = canonical.split("::");
+  const head = left ? left.split(":") : [];
+  const tail = right ? right.split(":") : [];
+  const words = right !== undefined ? [...head, ...Array(8 - head.length - tail.length).fill("0"), ...tail] : head;
+  const numbers = words.map((word) => parseInt(word, 16));
+  if (numbers.slice(0, 5).every((n) => n === 0) && numbers[5] === 0xffff) {
+    return `${numbers[6] >> 8}.${numbers[6] & 255}.${numbers[7] >> 8}.${numbers[7] & 255}`;
+  }
+  return numbers.slice(0, 4).map((n) => n.toString(16)).join(":") + "::/64";
+}
+
 function requestedScopes(scopes: readonly string[], machines: readonly string[]): string[] {
   const enrolled = new Set(machines);
   return normalizeScopes(scopes).filter(
@@ -189,6 +206,8 @@ export class FabricOAuthProvider implements OAuthServerProvider {
   readonly #now: () => number;
   readonly #listMachines: () => string[];
   readonly #clientsStore: OAuthRegisteredClientsStore;
+  #approvalTail: Promise<unknown> = Promise.resolve();
+  #queuedApprovals = 0;
 
   constructor({ db, mcpResourceUrl, now = Date.now, listMachines = () => [] }: ProviderOptions) {
     this.#db = db;
@@ -553,6 +572,7 @@ ${machineControls}</fieldset>
   }
 
   approvalDelayMs(clientIp: string): number {
+    clientIp = approvalClientKey(clientIp);
     const now = this.#nowSeconds();
     this.#db.prepare("DELETE FROM oauth_authorization_failures WHERE occurred_at <= ?").run(now - 15 * 60);
     const globalCount = (this.#db.prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures").get() as { count: number }).count;
@@ -564,6 +584,7 @@ ${machineControls}</fieldset>
   }
 
   recordApprovalFailure(id: string, clientIp = "unknown"): boolean {
+    clientIp = approvalClientKey(clientIp);
     const now = this.#nowSeconds();
     return this.#transaction(() => {
       this.#db
@@ -595,6 +616,7 @@ ${machineControls}</fieldset>
   }
 
   enforceHubApprovalLockout(id: string, clientIp = "unknown"): boolean {
+    clientIp = approvalClientKey(clientIp);
     const now = this.#nowSeconds();
     return this.#transaction(() => {
       this.#db
@@ -610,13 +632,32 @@ ${machineControls}</fieldset>
           .prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures WHERE client_ip = ?")
           .get(clientIp) as { count: number }
       ).count;
-      if (pendingCount < 5 && ipCount < 20) return false;
+      const globalCount = (this.#db.prepare("SELECT COUNT(*) AS count FROM oauth_authorization_failures").get() as { count: number }).count;
+      if (pendingCount < 5 && ipCount < 20 && globalCount < 40) return false;
       this.#db.prepare("DELETE FROM oauth_pending_authorizations WHERE id = ?").run(id);
       return true;
     });
   }
 
-  validateAuthorizationRequest(params: Record<string, unknown>): string | null {
+  async verifyApproval(id: string, clientIp: string, passphrase: string): Promise<"approved" | "incorrect" | "locked"> {
+    if (this.#queuedApprovals >= 128) return "locked";
+    this.#queuedApprovals++;
+    const result = this.#approvalTail.then(async () => {
+      if (this.enforceHubApprovalLockout(id, clientIp) || !this.#getPending(id)) return "locked" as const;
+      if (await this.verifyOwnerPassphrase(passphrase)) return "approved" as const;
+      const locked = this.recordApprovalFailure(id, clientIp);
+      const delay = this.approvalDelayMs(clientIp);
+      if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+      return locked ? "locked" as const : "incorrect" as const;
+    });
+    this.#approvalTail = result.catch(() => undefined);
+    try { return await result; }
+    finally { this.#queuedApprovals--; }
+  }
+
+  validateAuthorizationRequest(body: unknown): string | null {
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return "Invalid authorization body.";
+    const params = body as Record<string, unknown>;
     for (const name of [
       "client_id",
       "redirect_uri",
@@ -669,7 +710,7 @@ ${machineControls}</fieldset>
     this.#db.prepare("DELETE FROM oauth_pending_authorizations WHERE expires_at <= ?").run(now);
     this.#db.prepare("DELETE FROM oauth_authorization_codes WHERE expires_at <= ?").run(now);
     const protectedClause = protectedClientId ? " AND client_id <> ?" : "";
-    const params: Array<string | number> = [now - 30 * 24 * 60 * 60];
+    const params: Array<string | number> = [now - 60 * 60];
     if (protectedClientId) params.push(protectedClientId);
     this.#db
       .prepare(
@@ -725,22 +766,30 @@ ${machineControls}</fieldset>
       .get() !== undefined;
   }
 
-  verifyOwnerPassphrase(passphrase: string): boolean {
+  async verifyOwnerPassphrase(passphrase: string): Promise<boolean> {
     const row = this.#db
       .prepare("SELECT salt, hash FROM oauth_owner_credentials WHERE id = 1")
       .get() as OwnerCredentialRow | undefined;
     if (!row) return false;
     const expected = Buffer.from(row.hash, "base64");
-    const actual = scryptSync(passphrase, Buffer.from(row.salt, "base64"), expected.length, {
+    const actual = await new Promise<Buffer>((resolve, reject) => scrypt(passphrase, Buffer.from(row.salt, "base64"), expected.length, {
       N: 2 ** 15,
       r: 8,
       p: 1,
       maxmem: 64 * 1024 * 1024,
-    });
+    }, (error, derived) => error ? reject(error) : resolve(derived)));
     return actual.length === expected.length && timingSafeEqual(actual, expected);
   }
 
   createPersonalToken(name: string, scopes: readonly string[]): { id: string; token: string } {
+    const normalized = normalizeScopes(scopes);
+    if (scopes.length === 0 || scopes.some((scope) => !normalized.includes(scope))) {
+      throw new InvalidScopeError("Scopes must be nonempty and contain only supported entries");
+    }
+    const enrolled = new Set(this.#listMachines());
+    if (normalized.some((scope) => scope.startsWith(MACHINE_SCOPE_PREFIX) && !enrolled.has(scope.slice(MACHINE_SCOPE_PREFIX.length)))) {
+      throw new InvalidScopeError("Scope names an unknown or revoked machine");
+    }
     const id = randomId(16);
     const token = `mmf_pat_${randomId()}`;
     this.#db
@@ -882,7 +931,17 @@ ${machineControls}</fieldset>
   ): OAuthClientInformationFull {
     this.pruneOAuthStorage();
     const count = (this.#db.prepare("SELECT COUNT(*) AS count FROM oauth_clients").get() as { count: number }).count;
-    if (count >= 500) throw new InvalidRequestError("This hub has reached its registered-client limit");
+    if (count >= 500) {
+      this.#db.prepare(`DELETE FROM oauth_clients WHERE client_id IN (
+        SELECT client_id FROM oauth_clients
+         WHERE token_issued_at IS NULL
+           AND client_id NOT IN (SELECT client_id FROM oauth_pending_authorizations)
+           AND client_id NOT IN (SELECT client_id FROM oauth_authorization_codes)
+         ORDER BY created_at, rowid LIMIT ?
+      )`).run(count - 499);
+      const remaining = (this.#db.prepare("SELECT COUNT(*) AS count FROM oauth_clients").get() as { count: number }).count;
+      if (remaining >= 500) throw new InvalidRequestError("This hub has reached its active registered-client limit");
+    }
     const registered: OAuthClientInformationFull = {
       ...client,
       client_id: randomId(),
@@ -1038,6 +1097,7 @@ export function createOAuthRouter({
   });
   router.post("/oauth/approve", express.urlencoded({ extended: false }), async (req, res) => {
     provider.pruneOAuthStorage();
+    req.body = typeof req.body === "object" && req.body !== null && !Array.isArray(req.body) ? req.body : {};
     const pendingId = typeof req.body.pending_id === "string" ? req.body.pending_id : "";
     const action = typeof req.body.action === "string" ? req.body.action : "";
     const pending = provider.getPendingAuthorization(pendingId);
@@ -1064,15 +1124,6 @@ export function createOAuthRouter({
       return;
     }
     const clientIp = req.ip || req.socket.remoteAddress || "unknown";
-    const delayMs = provider.approvalDelayMs(clientIp);
-    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
-    if (provider.enforceHubApprovalLockout(pendingId, clientIp)) {
-      res
-        .status(429)
-        .type("html")
-        .send("<!doctype html><title>Too many attempts</title><p>Too many failed attempts. Start a new authorization request.</p>");
-      return;
-    }
     const submitted = req.body.scope;
     const selectedScopes =
       typeof submitted === "string"
@@ -1089,8 +1140,9 @@ export function createOAuthRouter({
           : [];
     const machineMode = req.body.machine_mode === "only" ? "only" : "all";
     const passphrase = typeof req.body.passphrase === "string" ? req.body.passphrase : "";
-    if (!provider.verifyOwnerPassphrase(passphrase)) {
-      if (provider.recordApprovalFailure(pendingId, clientIp)) {
+    const verification = await provider.verifyApproval(pendingId, clientIp, passphrase);
+    if (verification !== "approved") {
+      if (verification === "locked") {
         res
           .status(429)
           .type("html")
@@ -1111,7 +1163,14 @@ export function createOAuthRouter({
       provider.renderConsentPage(pending, res, "Select at least one enrolled machine or choose all machines", selectedScopes, selectedMachines, machineMode);
       return;
     }
-    const approved = provider.approvePendingAuthorization(pendingId, grantedFabric, grantedMachines, machineMode === "only");
+    let approved: ReturnType<FabricOAuthProvider["approvePendingAuthorization"]>;
+    try {
+      approved = provider.approvePendingAuthorization(pendingId, grantedFabric, grantedMachines, machineMode === "only");
+    } catch (error) {
+      if (!(error instanceof InvalidScopeError)) throw error;
+      provider.renderConsentPage(pending, res, error.message, selectedScopes, selectedMachines, machineMode);
+      return;
+    }
     if (!approved) {
       res.status(400).type("html").send("<!doctype html><title>Invalid request</title><p>This authorization request is invalid or expired.</p>");
       return;

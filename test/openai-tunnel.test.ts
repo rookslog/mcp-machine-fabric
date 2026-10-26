@@ -32,11 +32,27 @@ async function makeSandbox(): Promise<{ root: string; home: string; temp: string
   return { root, home, temp, runtimeEnv };
 }
 
+async function ephemeralHealthAddress(): Promise<string> {
+  const probe = createServer();
+  await new Promise<void>((resolve, reject) => {
+    probe.once("error", reject);
+    probe.listen(0, "127.0.0.1", resolve);
+  });
+  const address = probe.address();
+  if (!address || typeof address === "string") throw new Error("expected an ephemeral health address");
+  const port = address.port;
+  await new Promise<void>((resolve, reject) => probe.close((error) => error ? reject(error) : resolve()));
+  return `127.0.0.1:${port}`;
+}
+
 async function runScript(
   args: string[],
   sandbox: Awaited<ReturnType<typeof makeSandbox>>,
   env: NodeJS.ProcessEnv = {},
 ): Promise<ScriptResult> {
+  // Doctor binds this listener even during preflight. Do not contend with a
+  // live tunnel or another test using the production default health port.
+  if (!args.includes("--health")) args = [...args, "--health", await ephemeralHealthAddress()];
   return await new Promise((resolve, reject) => {
     const child = spawn("bash", [setupScript, ...args], {
       cwd: repoRoot,
@@ -117,8 +133,9 @@ afterEach(async () => {
 describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
   test("dry-run writes an isolated PAT-header profile and unit preview without touching systemd", async () => {
     const sandbox = await makeSandbox();
+    const health = await ephemeralHealthAddress();
     const result = await runScript(
-      ["tunnel_0123456789abcdef", "--profile", "mmf-hub", "--health", "127.0.0.1:8082", "--dry-run"],
+      ["tunnel_0123456789abcdef", "--profile", "mmf-hub", "--health", health, "--dry-run"],
       sandbox,
     );
 
@@ -136,7 +153,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     const unitText = await readFile(unit, "utf8");
 
     expect(profileText).toContain('tunnel_id: "tunnel_0123456789abcdef"');
-    expect(profileText).toContain('listen_addr: "127.0.0.1:8082"');
+    expect(profileText).toContain(`listen_addr: "${health}"`);
     expect(profileText).toContain('url: "http://127.0.0.1:8787/mcp"');
     expect(profileText).toContain(`Authorization: "file:${authHeader}"`);
     expect(profileText.match(/Authorization:/g)).toHaveLength(2);
