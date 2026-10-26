@@ -3,7 +3,7 @@
 Living record of what is verified, how, and what is not. Update it in the same
 change as anything it describes.
 
-_Last updated: 2026-10-25 (auth review follow-up; deployment observations below remain the original snapshot)._
+_Last updated: 2026-10-26 (auth review fixes and release hygiene; deployment snapshot below remains 2026-10-08)._
 
 ## Deployment (owner's machines)
 
@@ -28,6 +28,14 @@ OAuth requires an HTTPS issuer, the deployed hub runs **PAT-only** until it
 gets an HTTPS public URL. See [CHATGPT.md](CHATGPT.md) for the owner steps.
 
 ## Verified behaviour
+
+2026-10-26, isolated Linux source installs: immutable release reuse and dirty
+content identities; SQLite online backup and exact device/PAT/request restore
+after graceful and crash stops (including WAL/SHM cleanup); X → Y → X rollback
+with both processes restarted and health/readiness/status/read-only MCP checks.
+Automated in `test/release-hygiene.test.ts` and `test/release-procedures.test.ts`;
+SQLite cases skip explicitly without the CLI. No live-service or macOS runtime
+qualification is implied by this isolated exercise.
 
 Automated (`npm test`; macOS arm64 Node 26 locally, Linux x64 Node 22 on
 DIONYSUS, GitHub Actions ubuntu/macOS): durable jobs, file tools and policy,
