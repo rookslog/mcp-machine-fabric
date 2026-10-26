@@ -2,6 +2,25 @@
 
 All notable changes to this project are documented in this file.
 
+## Unreleased
+
+### Fixed
+
+- Delivery findings from the 2026-10-26 Codex review: persist acknowledgement
+  history and result-cache retention horizons; prevent overlapping state-dir
+  owners; bind every result/recovery to its dispatch state directory; claim
+  duplicate request ids synchronously; keep terminal ledger states monotonic
+  and settle pending callers when recovery supplies their outcome.
+- Unavailable/denied requests finalize directly as `not_dispatched`, preserving
+  retry behavior under terminal-state guards. Legacy unresolved history migrates
+  conservatively, so uncertain acknowledgement history keeps its key.
+
+### Operations
+
+- Agents use a portable exclusive `agent.lock` PID file and drain handlers on
+  graceful stop. After a crash, stale locks require explicit offline removal;
+  see [delivery semantics](docs/PROTOCOL.md#request-lifecycle).
+
 ## 0.1.0 - 2026-10-08
 
 ### Added

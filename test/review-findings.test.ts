@@ -29,6 +29,7 @@ async function authenticatedAgentSocket(h: Harness, machine: string): Promise<We
     ws.once("open", resolve);
     ws.once("error", reject);
   });
+  ws.send(JSON.stringify({ type: "hello", info: enrolled.agent.info() } satisfies AgentToHub));
   return ws;
 }
 
@@ -43,6 +44,8 @@ function createUnknown(h: Harness, machine: string, requestId = newRequestId()):
     args_summary: "{}",
     state: "dispatched_unknown",
   });
+  const stateId = h.agents[machine]?.agent.info().state_id;
+  if (stateId) h.store.recordRoute(requestId, stateId);
   return requestId;
 }
 

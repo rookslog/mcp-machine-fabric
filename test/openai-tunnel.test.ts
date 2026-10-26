@@ -20,7 +20,7 @@ interface ScriptResult {
   stderr: string;
 }
 
-async function makeSandbox(): Promise<{ root: string; home: string; temp: string; runtimeEnv: string }> {
+async function makeSandbox(): Promise<{ root: string; home: string; temp: string; runtimeEnv: string; mcpUrl: string; healthAddr: string }> {
   const root = await mkdtemp(path.join(tmpdir(), "mmf-openai-tunnel-test-"));
   tempRoots.add(root);
   const home = path.join(root, "home");
@@ -29,7 +29,12 @@ async function makeSandbox(): Promise<{ root: string; home: string; temp: string
   await Promise.all([mkdir(home), mkdir(temp)]);
   await writeFile(runtimeEnv, "CONTROL_PLANE_API_KEY=dry-run-control-plane-key\n", { mode: 0o600 });
   await chmod(runtimeEnv, 0o600);
-  return { root, home, temp, runtimeEnv };
+  const mcpUrl = await startMcpServer(404);
+  const healthProbe = createServer();
+  await new Promise<void>((resolve) => healthProbe.listen(0, "127.0.0.1", resolve));
+  const healthPort = (healthProbe.address() as { port: number }).port;
+  await new Promise<void>((resolve) => healthProbe.close(() => resolve()));
+  return { root, home, temp, runtimeEnv, mcpUrl, healthAddr: `127.0.0.1:${healthPort}` };
 }
 
 async function runScript(
@@ -38,7 +43,7 @@ async function runScript(
   env: NodeJS.ProcessEnv = {},
 ): Promise<ScriptResult> {
   return await new Promise((resolve, reject) => {
-    const child = spawn("bash", [setupScript, ...args], {
+    const child = spawn("bash", [setupScript, "--health", sandbox.healthAddr, ...args], {
       cwd: repoRoot,
       env: {
         ...process.env,
@@ -46,6 +51,7 @@ async function runScript(
         TMPDIR: sandbox.temp,
         OPENAI_TUNNEL_RUNTIME_ENV: sandbox.runtimeEnv,
         TUNNEL_CLIENT_BIN: tunnelClient,
+        MMF_TUNNEL_MCP_URL: sandbox.mcpUrl,
         ...env,
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -118,7 +124,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
   test("dry-run writes an isolated PAT-header profile and unit preview without touching systemd", async () => {
     const sandbox = await makeSandbox();
     const result = await runScript(
-      ["tunnel_0123456789abcdef", "--profile", "mmf-hub", "--health", "127.0.0.1:8082", "--dry-run"],
+      ["tunnel_0123456789abcdef", "--profile", "mmf-hub", "--health", sandbox.healthAddr, "--dry-run"],
       sandbox,
     );
 
@@ -136,8 +142,8 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
     const unitText = await readFile(unit, "utf8");
 
     expect(profileText).toContain('tunnel_id: "tunnel_0123456789abcdef"');
-    expect(profileText).toContain('listen_addr: "127.0.0.1:8082"');
-    expect(profileText).toContain('url: "http://127.0.0.1:8787/mcp"');
+    expect(profileText).toContain(`listen_addr: "${sandbox.healthAddr}"`);
+    expect(profileText).toContain(`url: "${sandbox.mcpUrl}"`);
     expect(profileText).toContain(`Authorization: "file:${authHeader}"`);
     expect(profileText.match(/Authorization:/g)).toHaveLength(2);
     expect(await readFile(rawPat, "utf8")).toMatch(/^mmf_pat_dry_run_[A-Za-z0-9_-]+\n$/);
@@ -268,7 +274,7 @@ describe.skipIf(!tunnelClientAvailable)("setup-openai-tunnel.sh", () => {
 
     expect(result.code).toBe(0);
     expect(result.stdout).toContain("CHECK tunnel_id                PASS");
-    expect(result.stdout).toContain("CHECK mcp_target               PASS http://127.0.0.1:8787/mcp");
+    expect(result.stdout).toContain(`CHECK mcp_target               PASS ${sandbox.mcpUrl}`);
     expect(result.stdout + result.stderr).not.toContain("mmf_pat_dry_run");
     const artifactDir = result.stdout.match(/^Dry-run artifact directory: (.+)$/m)?.[1];
     const profile = await readFile(path.join(artifactDir!, "profiles", "mmf-hub.yaml"), "utf8");

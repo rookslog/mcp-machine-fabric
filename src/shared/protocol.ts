@@ -70,7 +70,7 @@ export type AgentToHub =
   | { type: "hello"; info: AgentInfo }
   | { type: "accepted"; request_id: string }
   | { type: "result"; request_id: string; outcome: ToolOutcome; duration_ms: number }
-  | { type: "recovered"; request_id: string; state: "completed" | "failed" | "running" | "unknown"; outcome?: ToolOutcome }
+  | { type: "recovered"; request_id: string; state: "completed" | "failed" | "running" | "unknown"; outcome?: ToolOutcome; retained_since?: string }
   | { type: "health"; executor: ExecutorHealth }
   | { type: "pong"; nonce: string };
 

@@ -27,6 +27,8 @@ export interface RequestRow {
   args_summary: string;
   state: RequestState;
   created_at: number;
+  dispatched_at: number | null;
+  acked_at: number | null;
   updated_at: number;
   finished_at: number | null;
   duration_ms: number | null;
@@ -101,6 +103,8 @@ export class HubStore {
         state TEXT NOT NULL,
         created_at INTEGER NOT NULL,
         updated_at INTEGER NOT NULL,
+        dispatched_at INTEGER,
+        acked_at INTEGER,
         finished_at INTEGER,
         duration_ms INTEGER,
         error_code TEXT,
@@ -115,6 +119,15 @@ export class HubStore {
       CREATE UNIQUE INDEX IF NOT EXISTS requests_idem ON requests(principal, machine, tool, idempotency_key)
         WHERE idempotency_key IS NOT NULL;
     `);
+    const columns = this.db.prepare("PRAGMA table_info(requests)").all() as unknown as { name: string }[];
+    if (!columns.some((c) => c.name === "acked_at")) {
+      this.db.exec(`BEGIN IMMEDIATE; ALTER TABLE requests ADD COLUMN acked_at INTEGER;
+        UPDATE requests SET acked_at = updated_at WHERE state IN ('accepted', 'dispatched_unknown'); COMMIT;`);
+    }
+    if (!columns.some((c) => c.name === "dispatched_at")) {
+      this.db.exec(`BEGIN IMMEDIATE; ALTER TABLE requests ADD COLUMN dispatched_at INTEGER;
+        UPDATE requests SET dispatched_at = created_at WHERE state IN ('dispatched', 'accepted', 'dispatched_unknown'); COMMIT;`);
+    }
   }
 
   // ---- devices -----------------------------------------------------------
@@ -178,32 +191,42 @@ export class HubStore {
     const now = Date.now();
     this.db
       .prepare(
-        `INSERT INTO requests (request_id, machine, tool, effect, principal, idempotency_key, args_summary, state, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO requests (request_id, machine, tool, effect, principal, idempotency_key, args_summary, state, created_at, updated_at, dispatched_at, acked_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
-      .run(r.request_id, r.machine, r.tool, r.effect, r.principal, r.idempotency_key, r.args_summary, r.state, now, now);
+      .run(r.request_id, r.machine, r.tool, r.effect, r.principal, r.idempotency_key, r.args_summary, r.state, now, now, ["dispatched", "accepted", "dispatched_unknown"].includes(r.state) ? now : null, r.state === "accepted" ? now : null);
   }
 
   setState(requestId: string, state: RequestState, errorCode: string | null = null): void {
     this.db
-      .prepare("UPDATE requests SET state = ?, updated_at = ?, error_code = COALESCE(?, error_code) WHERE request_id = ?")
-      .run(state, Date.now(), errorCode, requestId);
+      .prepare(`UPDATE requests SET state = ?, updated_at = ?, error_code = COALESCE(?, error_code),
+        acked_at = CASE WHEN ? = 'accepted' THEN COALESCE(acked_at, ?) ELSE acked_at END,
+        dispatched_at = CASE WHEN ? = 'dispatched' THEN COALESCE(dispatched_at, ?) ELSE dispatched_at END
+        WHERE request_id = ? AND state NOT IN ('completed', 'failed', 'not_dispatched')`)
+      .run(state, Date.now(), errorCode, state, Date.now(), state, Date.now(), requestId);
   }
 
-  finish(requestId: string, outcome: ToolOutcome, keepFullOutcome: boolean): void {
+  /** Preserve receipt evidence even after the pending caller has timed out. */
+  recordAcknowledgement(requestId: string): void {
+    const now = Date.now();
+    this.db.prepare(`UPDATE requests SET acked_at = COALESCE(acked_at, ?), updated_at = ?
+      WHERE request_id = ? AND state NOT IN ('completed', 'failed', 'not_dispatched')`).run(now, now, requestId);
+  }
+
+  finish(requestId: string, outcome: ToolOutcome, keepFullOutcome: boolean, state: "completed" | "failed" | "not_dispatched" = outcome.ok ? "completed" : "failed", errorCode?: string): void {
     const row = this.getRequest(requestId);
     const now = Date.now();
     const stored = keepFullOutcome ? outcome : truncateOutcome(outcome);
     this.db
       .prepare(
-        `UPDATE requests SET state = ?, updated_at = ?, finished_at = ?, duration_ms = ?, error_code = ?, outcome_json = ? WHERE request_id = ?`,
+        `UPDATE requests SET state = ?, updated_at = ?, finished_at = ?, duration_ms = ?, error_code = ?, outcome_json = ? WHERE request_id = ? AND state NOT IN ('completed', 'failed', 'not_dispatched')`,
       )
       .run(
-        outcome.ok ? "completed" : "failed",
+        state,
         now,
         now,
         row ? now - row.created_at : null,
-        outcome.ok ? null : outcome.code,
+        errorCode ?? (outcome.ok ? null : outcome.code),
         JSON.stringify(stored),
         requestId,
       );
@@ -223,7 +246,7 @@ export class HubStore {
     const now = Date.now();
     this.db
       .prepare(
-        "UPDATE requests SET state = 'not_dispatched', error_code = 'never_received', updated_at = ?, finished_at = ? WHERE request_id = ?",
+        "UPDATE requests SET state = 'not_dispatched', error_code = 'never_received', updated_at = ?, finished_at = ? WHERE request_id = ? AND state IN ('dispatched', 'dispatched_unknown') AND acked_at IS NULL",
       )
       .run(now, now, requestId);
   }

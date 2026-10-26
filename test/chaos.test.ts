@@ -1,9 +1,12 @@
 import { createHash } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import nodePath from "node:path";
-import { expect, test } from "vitest";
+import { expect, test, vi } from "vitest";
 import { ResultCache } from "../src/agent/result-cache.js";
+import { Agent } from "../src/agent/agent.js";
+import type { AgentToHub } from "../src/shared/protocol.js";
+import { newRequestId } from "../src/hub/store.js";
 import { call, makeHarness, waitFor } from "./helpers.js";
 
 const DEFAULT_SEED = 0x5eedc0de;
@@ -186,7 +189,8 @@ test("final recovery terminalizes a request absent from the agent cache", async 
     await firstClient.close();
     const sentinelId = sentinel.structuredContent?.request_id as string;
     expect(sentinel.structuredContent?.state).toBe("completed");
-    h.store.setState(sentinelId, "dispatched_unknown");
+    // Terminal rows cannot be reopened even by a test fixture.
+    expect(h.store.getRequest(sentinelId)?.state).toBe("completed");
 
     const requestId = "r_a_000000000002";
     const key = "chaos-minimized-unknown";
@@ -808,3 +812,51 @@ test(
   },
   60_000,
 );
+
+// A lost ack leaves no hub acknowledgement history: expiry must independently
+// retain the key, even across both agent and hub restart.
+test("expired-cache chaos schedule never releases an executed key when its ack was lost", async () => {
+  const h = await makeHarness(["alpha"]);
+  try {
+    const agent = await h.startAgent("alpha");
+    const internal = agent as unknown as { send(frame: AgentToHub): void };
+    const send = internal.send.bind(agent);
+    let requestId = "";
+    let finished!: () => void;
+    const dropped = new Promise<void>((resolve) => { finished = resolve; });
+    vi.spyOn(internal, "send").mockImplementation((frame) => {
+      if (frame.type === "accepted") return;
+      if (frame.type === "result") { requestId = frame.request_id; finished(); return; }
+      send(frame);
+    });
+    const client = await h.client();
+    const marker = nodePath.join(h.agents.alpha.root, "expired-chaos.txt");
+    const args = { machine: "alpha", path: marker, content: "once\n", mode: "append", idempotency_key: "chaos-expired-lost-ack" };
+    const pending = call(client, "write_file", args);
+    await dropped;
+    expect(h.store.getRequest(requestId)?.state).toBe("dispatched");
+    await agent.stop();
+    expect((await pending).structuredContent?.state).toBe("dispatched_unknown");
+    const old = new Date(Date.now() - 25 * 3600 * 1000);
+    const recordFile = nodePath.join(h.agents.alpha.stateDir, "results", `${requestId}.json`);
+    await utimes(recordFile, old, old);
+    await h.restartHub();
+    const replacement = new Agent({ hubUrl: h.url.replace(/^http/, "ws") + "/agent", token: h.agents.alpha.token, stateDir: h.agents.alpha.stateDir, policy: agent.executor.policy });
+    h.agents.alpha.agent = replacement;
+    await replacement.start();
+    await replacement.waitConnected();
+    // Same-socket result sentinel orders the genuine recovery before assertions.
+    const sentinel = newRequestId();
+    h.store.createRequest({ request_id: sentinel, machine: "alpha", tool: "read_file", effect: "read", principal: "test:owner", idempotency_key: null, args_summary: "{}", state: "dispatched_unknown" });
+    h.store.recordRoute(sentinel, replacement.info().state_id!);
+    const recovered = replacement as unknown as { send(frame: AgentToHub): void; onMessage(raw: string): Promise<void> };
+    await recovered.onMessage(JSON.stringify({ type: "recover", request_ids: [requestId] }));
+    recovered.send({ type: "result", request_id: sentinel, outcome: { ok: true, text: "sentinel" }, duration_ms: 0 });
+    await waitFor(async () => h.store.getRequest(sentinel)?.state === "completed");
+    await expect(readFile(recordFile)).rejects.toMatchObject({ code: "ENOENT" });
+    expect(h.store.getRequest(requestId)).toMatchObject({ state: "dispatched_unknown", acked_at: null, idempotency_key: args.idempotency_key });
+    const retry = await call(await h.client(), "write_file", args);
+    expect(retry.structuredContent?.request_id).toBe(requestId);
+    expect(await readFile(marker, "utf8")).toBe("once\n");
+  } finally { vi.restoreAllMocks(); await h.cleanup(); }
+});

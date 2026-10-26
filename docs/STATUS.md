@@ -3,7 +3,7 @@
 Living record of what is verified, how, and what is not. Update it in the same
 change as anything it describes.
 
-_Last updated: 2026-10-08 (initial build night)._
+_Last updated: 2026-10-26 (delivery-review fixes; deployment entries remain historical)._
 
 ## Deployment (owner's machines)
 
@@ -53,6 +53,24 @@ Live, on the deployed services (2026-10-08, from Apollo unless noted):
 | macOS installer live | `scripts/install-agent.sh` reinstalled the Apollo agent; **found** a launchd bootout/bootstrap race ("5: Input/output error") → fixed and re-run successfully | launchd log |
 | Docker image (hub) | built and smoke-tested on DIONYSUS by a worker: health, enrollment, host agent READY, `run_command` through the container; cleaned up | packaging slice report |
 | Warm command latency through the hub | ~0.1 s DIONYSUS, ~0.33 s Apollo; first command after the Apollo agent started took 7.9 s (cold; cause unchecked) | probe timings |
+
+Bugs found by the Codex delivery review on 2026-10-26 and fixed in source:
+expired receipt history could falsely release a used key; overlapping owners of
+one state directory could attest non-receipt before the old handler executed;
+positive recovery and late outcomes lacked state-directory binding; concurrent
+duplicate frames could execute twice; and pending-call cleanup could reopen an
+accepted recovered terminal outcome. Permanent regressions are
+`test/lane-delivery-*.test.ts`, `test/delivery-contract.test.ts`, and the
+expired-cache/lost-ack invariant in `test/chaos.test.ts`. Local Linux full-suite results (178 passed, 1 skipped; 21 files) are
+recorded in the DELIVERY-FIXES-sol lane report; independent lead/Opus re-review,
+macOS CI, and deployment remain separate gates. The branch changes are left
+uncommitted for the lead by instruction.
+
+The new state-directory lock is retained until graceful handler drain. A crash
+leaves a stale lock requiring offline operator removal. Existing pre-horizon
+cache directories and legacy unknown ledger rows migrate conservatively;
+manual state deletion, filesystem rollback and cross-host clock skew remain
+outside the local runtime qualification. See [PROTOCOL.md](PROTOCOL.md#request-lifecycle).
 
 Bugs found by tests/reviews and fixed during the build: a cross-vendor
 review (Codex) found that a stale `recovered: running` frame could reopen a

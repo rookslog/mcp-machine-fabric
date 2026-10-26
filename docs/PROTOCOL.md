@@ -22,7 +22,7 @@ Frames are JSON text messages with a `type` field.
 | agent → hub | `accepted {request_id}` | the agent durably recorded the call (before executing) |
 | agent → hub | `result {request_id, outcome, duration_ms}` | final outcome |
 | hub → agent | `recover {request_ids}` | after (re)connect: what happened to these? |
-| agent → hub | `recovered {request_id, state, outcome?}` | `completed`/`failed` with outcome, `running`, or `unknown` |
+| agent → hub | `recovered {request_id, state, outcome?, retained_since?}` | `completed`/`failed` with outcome, `running`, or `unknown` with a retained-history horizon |
 
 ## Request lifecycle
 
@@ -47,20 +47,45 @@ Rules:
    client is told `dispatched_unknown` with the request id. Nothing is
    guessed. When the agent reconnects the hub asks for those ids and records
    the true outcome; a result that arrives late on a live socket is also
-   recorded. If the agent itself restarted mid-call, it reports `failed` with
+   recorded. Every result and recovery state is bound to the recorded machine
+   and state directory; mismatched or absent routes are rejected and logged.
+   Terminal ledger rows (`completed`, `failed`, `not_dispatched`) cannot reopen.
+   A recovered terminal outcome also settles any pending caller and clears its
+   timer. If the agent itself restarted mid-call, it reports `failed` with
    an explanation and, for commands, the `job_id` that is still running.
 4. **Hub restart.** On start the hub marks every `dispatched`/`accepted`
    request as `dispatched_unknown`, then recovers them as agents reconnect.
-5. **Attested non-receipt.** The agent records a call durably before acking or
-   executing it, and marks receipt in memory before its first `await`. So when
-   the owning agent answers `recover` with `unknown` for a call it never
-   acknowledged, the call provably never ran: the hub marks it
-   `not_dispatched` (`error_code: never_received`). An acknowledged call whose
-   record has since vanished (pruned after 24 h, state dir wiped) stays
-   `dispatched_unknown`. Each agent state directory has a persistent
-   `state_id`; the hub records which one a call was dispatched to and accepts
-   "never received" only from that same state directory, so two agents
-   sharing one device token cannot vouch for each other.
+5. **Attested non-receipt.** The agent records a call before acking or
+   executing it, and synchronously claims the request id before its first
+   `await`. Duplicate frames wait for that claim and re-ack/replay; they never
+   execute a second handler. Every `recovered/unknown` includes
+   `retained_since`, an ISO UTC timestamp from the persistent result-cache
+   horizon. The hub accepts `never_received` only for a `dispatched` or
+   `dispatched_unknown` row whose durable `acked_at` is null, whose dispatch
+   time is at or after that horizon, and whose machine and recorded `state_id`
+   match the connection. Older agents with no horizon cannot attest non-receipt.
+   Otherwise uncertainty and the idempotency key remain. Acknowledgement
+   history survives disconnects and hub restarts; cache expiry cannot erase it.
+
+   An agent exclusively owns its state directory using atomic creation of
+   `agent.lock` (PID plus an open descriptor). Startup refuses another owner,
+   including another instance in the same process or a directory alias. Stop
+   closes the socket and drains outstanding handlers before releasing the lock.
+   This exclusion is enforced by the agent, not by the hub's token-replacement
+   behavior. To avoid a check/unlink race on Linux and macOS without native
+   modules, stale locks are **not automatically removed**. After a crash, an
+   operator must stop all agents using that directory, confirm its recorded PID
+   is gone, and remove only that directory's `agent.lock` before restarting.
+
+   The horizon is persisted before expired completed/failed receipts are
+   removed; running receipts are retained. It starts at state-directory creation
+   for a fresh cache, or conservatively at initialization for an older cache
+   with no horizon. Normally pruning advances it to the cutoff; backdated file
+   mtimes can advance it further, beyond the discarded receipt's start time.
+   Unreadable/corrupt history is an error, never evidence of non-receipt.
+   Hub and agent timestamps assume comparable wall clocks; clock skew and
+   filesystem rollback are not covered by this protocol's local tests.
+
 6. **Idempotency keys** are scoped to (principal, machine, tool, key). A repeat
    returns the recorded outcome (`replayed: true`) or, if the first call is
    still unresolved, its state — never a second execution. A request that ended
@@ -72,6 +97,12 @@ keyed mutations across two agents with hub restarts, agent restarts, dropped
 connections and a full outage, asserting no duplicate side effects, outcomes
 that match side effects, nothing reported `not_dispatched` having run, and every
 request terminal after recovery (`CHAOS_SEED=<n>` reproduces a schedule).
+A separate expired-cache schedule drops both ack and result and checks that the
+original key remains reserved after cache expiry and hub/agent restart. The
+`test/lane-delivery-*.test.ts` and `test/delivery-contract.test.ts` regressions
+cover retention, exclusive ownership, state binding, duplicates and terminal
+monotonicity. These checks exercise API/filesystem ordering, not fsync or
+power-loss durability.
 
 ## Durable jobs
 

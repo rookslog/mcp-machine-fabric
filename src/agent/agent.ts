@@ -17,7 +17,8 @@ import { VERSION } from "../version.js";
 import { runFsTool, type FsToolName } from "./fs-tools.js";
 import { JobManager, type JobReadResult, type JobRecord } from "./jobs.js";
 import { checkExec, checkPath, PolicyError, type Policy } from "./policy.js";
-import { ResultCache } from "./result-cache.js";
+import { ResultCache, type CachedResult } from "./result-cache.js";
+import { StateLock } from "./state-lock.js";
 
 const FS_TOOLS = new Set<string>([
   "read_file",
@@ -174,6 +175,10 @@ export class Executor {
 export class Agent {
   readonly executor: Executor;
   private cache: ResultCache;
+  private stateLock: StateLock | null = null;
+  private stopping: Promise<void> | null = null;
+  private claims = new Map<string, { recorded: Promise<boolean>; done: Promise<void> }>();
+  private handlers = new Set<Promise<void>>();
   private ws: WebSocket | null = null;
   private stopped = false;
   private backoff: number;
@@ -213,39 +218,51 @@ export class Agent {
   }
 
   async start(): Promise<void> {
+    if (this.stopped) throw new Error("cannot restart a stopped Agent instance");
     await mkdir(this.opts.stateDir, { recursive: true, mode: 0o700 });
-    const idFile = nodePath.join(this.opts.stateDir, "state_id");
-    this.stateId = (await readFile(idFile, "utf8").catch(() => "")).trim() || undefined;
-    if (!this.stateId) {
-      this.stateId = `s_${randomBytes(8).toString("hex")}`;
-      await writeFile(idFile, this.stateId + "\n", { mode: 0o600, flag: "wx" }).catch(async () => {
-        this.stateId = (await readFile(idFile, "utf8")).trim();
-      });
-    }
-    await this.executor.init();
-    await this.cache.init();
-    const retention = this.opts.jobRetentionMs ?? 7 * 24 * 3600 * 1000;
-    const prune = async () => {
-      try {
-        const n = await this.executor.jobs.prune(retention);
-        if (n > 0) this.log("pruned finished jobs", { count: n });
-        await this.cache.prune();
-      } catch (err) {
-        this.log("prune failed", { error: String(err) });
+    this.stateLock = await StateLock.acquire(this.opts.stateDir);
+    try {
+      const idFile = nodePath.join(this.opts.stateDir, "state_id");
+      this.stateId = (await readFile(idFile, "utf8").catch(() => "")).trim() || undefined;
+      if (!this.stateId) {
+        this.stateId = `s_${randomBytes(8).toString("hex")}`;
+        await writeFile(idFile, this.stateId + "\n", { mode: 0o600, flag: "wx" }).catch(async () => {
+          this.stateId = (await readFile(idFile, "utf8")).trim();
+        });
       }
-    };
-    await prune();
-    this.pruneTimer = setInterval(() => void prune(), 6 * 3600 * 1000);
-    this.pruneTimer.unref();
-    this.connect();
-    this.healthTimer = setInterval(() => {
-      const t0 = Date.now();
-      setImmediate(() => {
-        this.loopLag = Date.now() - t0;
-      });
-      this.sendHealth();
-    }, 10_000);
-    this.healthTimer.unref();
+      await this.executor.init();
+      await this.cache.init();
+      const retention = this.opts.jobRetentionMs ?? 7 * 24 * 3600 * 1000;
+      const prune = async () => {
+        try {
+          const n = await this.executor.jobs.prune(retention);
+          if (n > 0) this.log("pruned finished jobs", { count: n });
+          await this.cache.prune();
+        } catch (err) {
+          this.log("prune failed", { error: String(err) });
+        }
+      };
+      await prune();
+      this.pruneTimer = setInterval(() => {
+        const pruning = prune();
+        this.handlers.add(pruning);
+        void pruning.finally(() => this.handlers.delete(pruning));
+      }, 6 * 3600 * 1000);
+      this.pruneTimer.unref();
+      this.connect();
+      this.healthTimer = setInterval(() => {
+        const t0 = Date.now();
+        setImmediate(() => {
+          this.loopLag = Date.now() - t0;
+        });
+        this.sendHealth();
+      }, 10_000);
+      this.healthTimer.unref();
+    } catch (err) {
+      await this.stateLock.release();
+      this.stateLock = null;
+      throw err;
+    }
   }
 
   /** Resolves once the hub has welcomed this agent. */
@@ -290,7 +307,11 @@ export class Agent {
       this.send({ type: "hello", info: this.info() });
       this.sendHealth();
     });
-    ws.on("message", (raw) => void this.onMessage(raw));
+    ws.on("message", (raw) => {
+      const handling = this.onMessage(raw).catch((err) => this.log("agent frame failed", { error: String(err) }));
+      this.handlers.add(handling);
+      void handling.finally(() => this.handlers.delete(handling));
+    });
     ws.on("error", (err) => this.log("hub connection error", { error: String(err) }));
     ws.on("close", (code, reason) => {
       if (this.ws === ws) this.ws = null;
@@ -304,6 +325,7 @@ export class Agent {
   }
 
   private async onMessage(raw: unknown): Promise<void> {
+    if (this.stopped) return;
     const msg = parseFrame<HubToAgent>(raw);
     if (!msg) return;
     switch (msg.type) {
@@ -315,16 +337,29 @@ export class Agent {
       case "ping":
         this.send({ type: "pong", nonce: msg.nonce });
         break;
-      case "call":
-        // Mark receipt before any await so a concurrent `recover` can never
-        // report "unknown" for a call this process is about to execute.
+      case "call": {
+        const claimed = this.claims.get(msg.request_id);
+        if (claimed) {
+          if (await claimed.recorded) {
+            const rec = await this.cache.get(msg.request_id);
+            if (rec) this.replay(msg.request_id, rec);
+          }
+          break;
+        }
+        // Reserve synchronously, before even starting the asynchronous lookup.
         this.received.add(msg.request_id);
-        try {
-          await this.handleCall(msg.request_id, msg.tool, msg.args);
-        } finally {
+        let recorded!: (ok: boolean) => void;
+        const receipt = new Promise<boolean>((resolve) => { recorded = resolve; });
+        const done = Promise.resolve().then(() => this.handleCall(msg.request_id, msg.tool, msg.args, () => recorded(true)));
+        this.claims.set(msg.request_id, { recorded: receipt, done });
+        try { await done; }
+        finally {
+          recorded(false); // Unblock duplicates even if lookup/reservation failed.
           this.received.delete(msg.request_id);
+          this.claims.delete(msg.request_id);
         }
         break;
+      }
       case "recover":
         for (const id of msg.request_ids) await this.handleRecover(id);
         break;
@@ -334,15 +369,11 @@ export class Agent {
     }
   }
 
-  private async handleCall(requestId: string, tool: string, args: Record<string, unknown>): Promise<void> {
+  private async handleCall(requestId: string, tool: string, args: Record<string, unknown>, recorded: () => void): Promise<void> {
     const existing = await this.cache.get(requestId);
     if (existing) {
-      // Duplicate delivery: never execute twice.
-      if (existing.state !== "running" && existing.outcome) {
-        this.send({ type: "result", request_id: requestId, outcome: existing.outcome, duration_ms: 0 });
-      } else {
-        this.send({ type: "accepted", request_id: requestId });
-      }
+      recorded();
+      this.replay(requestId, existing);
       return;
     }
     const t0 = Date.now();
@@ -352,10 +383,19 @@ export class Agent {
       this.send({ type: "result", request_id: requestId, outcome: fail("internal", `cannot record request: ${String(err)}`), duration_ms: 0 });
       return;
     }
+    recorded();
     this.send({ type: "accepted", request_id: requestId });
     const outcome = await this.executor.execute(tool, args, (jobId) => void this.cache.noteJob(requestId, jobId));
     await this.cache.finish(requestId, tool, outcome).catch((err) => this.log("result cache write failed", { error: String(err) }));
     this.send({ type: "result", request_id: requestId, outcome, duration_ms: Date.now() - t0 });
+  }
+
+  private replay(requestId: string, rec: CachedResult): void {
+    if (rec.state !== "running" && rec.outcome) {
+      this.send({ type: "result", request_id: requestId, outcome: rec.outcome, duration_ms: 0 });
+    } else {
+      this.send({ type: "accepted", request_id: requestId });
+    }
   }
 
   private async handleRecover(requestId: string): Promise<void> {
@@ -367,7 +407,7 @@ export class Agent {
     if (!rec) {
       // Attested: this agent never durably recorded the call, and it records
       // before executing anything, so the call never ran here.
-      this.send({ type: "recovered", request_id: requestId, state: "unknown" });
+      this.send({ type: "recovered", request_id: requestId, state: "unknown", retained_since: this.cache.retainedSince });
     } else if (rec.state === "running" && !this.cache.isOrphaned(rec)) {
       this.send({ type: "recovered", request_id: requestId, state: "running" });
     } else if (rec.state === "running") {
@@ -384,7 +424,11 @@ export class Agent {
     }
   }
 
-  async stop(): Promise<void> {
+  stop(): Promise<void> {
+    return this.stopping ??= this.stopAndDrain();
+  }
+
+  private async stopAndDrain(): Promise<void> {
     this.stopped = true;
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.healthTimer) clearInterval(this.healthTimer);
@@ -396,6 +440,11 @@ export class Agent {
         ws.close(1000, "agent stopping");
         setTimeout(r, 2000).unref();
       });
+    }
+    await Promise.allSettled([...this.handlers, ...[...this.claims.values()].map((claim) => claim.done)]);
+    if (this.stateLock) {
+      await this.stateLock.release();
+      this.stateLock = null;
     }
   }
 

@@ -252,8 +252,8 @@ function registerAgentTool(server: McpServer, ctx: McpContext, caller: CallerInf
         });
 
       if (!allowedMachines.includes(machine)) {
-        record("not_dispatched", null);
-        ctx.store.finish(requestId, { ok: false, code: "policy_denied", message: `machine ${machine} is outside this grant` }, false);
+        record("dispatched", null);
+        ctx.store.finish(requestId, { ok: false, code: "policy_denied", message: `machine ${machine} is outside this grant` }, false, "not_dispatched");
         return hubError(`This connection was not granted access to machine ${machine}.`, {
           ...base,
           state: "not_dispatched",
@@ -262,8 +262,8 @@ function registerAgentTool(server: McpServer, ctx: McpContext, caller: CallerInf
       }
 
       if (!caller.scopes.includes(needed)) {
-        record("not_dispatched", null);
-        ctx.store.finish(requestId, { ok: false, code: "policy_denied", message: `missing scope ${needed}` }, false);
+        record("dispatched", null);
+        ctx.store.finish(requestId, { ok: false, code: "policy_denied", message: `missing scope ${needed}` }, false, "not_dispatched");
         return hubError(
           `This connection was not granted ${needed}; ${spec.name} is not allowed. Re-authorize the connector with that scope if you need it.`,
           { ...base, state: "not_dispatched", error_code: "policy_denied" },
@@ -296,8 +296,7 @@ function registerAgentTool(server: McpServer, ctx: McpContext, caller: CallerInf
           ctx.store.finish(requestId, result.outcome, key !== null);
           return outcomeResult(result.outcome, { ...base, state: result.state, duration_ms: result.duration_ms });
         case "not_dispatched": {
-          ctx.store.finish(requestId, { ok: false, code: "internal", message: result.reason }, false);
-          ctx.store.setState(requestId, "not_dispatched", "unavailable");
+          ctx.store.finish(requestId, { ok: false, code: "internal", message: result.reason }, false, "not_dispatched", "unavailable");
           const h = ctx.registry.health(machine);
           return hubError(
             `Not executed: ${machine} is unavailable (${result.reason}; health: ${h.reason ?? "ok"}${h.last_seen ? `, last seen ${h.last_seen}` : ""}). Nothing ran, so it is safe to retry once the machine is ready.`,

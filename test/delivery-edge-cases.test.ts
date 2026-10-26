@@ -1,9 +1,11 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { readFile, unlink, writeFile } from "node:fs/promises";
 import nodePath from "node:path";
 import WebSocket from "ws";
 import { expect, test } from "vitest";
 import { PROTOCOL_VERSION, type AgentInfo, type AgentToHub, type HubToAgent } from "../src/shared/protocol.js";
 import { call, makeHarness, waitFor, type Harness } from "./helpers.js";
+import { startAgentProcess, killAgentProcess } from "./agent-process.js";
+import type { ChildProcess } from "node:child_process";
 
 async function rawAgent(h: Harness, machine: string): Promise<WebSocket> {
   const enrolled = h.agents[machine];
@@ -61,8 +63,11 @@ test("same-state agent restart cannot classify a received call as not_dispatched
   let gate: string | undefined;
   let jobId: string | undefined;
   let marker: string | undefined;
+  let child: ChildProcess | undefined;
   try {
-    await h.startAgent("alpha");
+    const original = await h.startAgent("alpha");
+    await original.stop();
+    child = await startAgentProcess({ hubUrl: h.url.replace(/^http/, "ws") + "/agent", token: h.agents.alpha.token, stateDir: h.agents.alpha.stateDir, policy: original.executor.policy });
     const client = await h.client();
     gate = nodePath.join(h.agents.alpha.root, "release-agent-restart");
     marker = nodePath.join(h.agents.alpha.root, "agent-restart.txt");
@@ -87,7 +92,9 @@ test("same-state agent restart cannot classify a received call as not_dispatched
     jobId = cached.job_id;
     await waitFor(async () => readFile(started, "utf8").then(() => true).catch(() => false));
 
-    await h.agents.alpha.agent.stop();
+    await killAgentProcess(child);
+    // Only this test's confirmed-dead child owns this temporary stale lock.
+    await unlink(nodePath.join(h.agents.alpha.stateDir, "agent.lock"));
     const interrupted = await pending;
     expect(interrupted.structuredContent?.state).toBe("dispatched_unknown");
 
@@ -109,6 +116,7 @@ test("same-state agent restart cannot classify a received call as not_dispatched
       25,
     );
   } finally {
+    if (child) await killAgentProcess(child);
     await releaseAndSettleJob(h, "alpha", gate, jobId);
     await h.cleanup();
   }

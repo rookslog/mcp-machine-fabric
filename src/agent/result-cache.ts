@@ -24,6 +24,8 @@ const ID_RE = /^r_[a-z0-9]+_[a-f0-9]+$/;
  */
 export class ResultCache {
   private mutations = new Map<string, Promise<void>>();
+  retainedSince = "";
+  private pruning: Promise<number> | null = null;
 
   constructor(
     private dir: string,
@@ -32,7 +34,18 @@ export class ResultCache {
   ) {}
 
   async init(): Promise<void> {
-    await mkdir(this.dir, { recursive: true, mode: 0o700 });
+    const createdDir = await mkdir(this.dir, { recursive: true, mode: 0o700 });
+    const horizonFile = nodePath.join(this.dir, "retained_since");
+    try {
+      this.retainedSince = (await readFile(horizonFile, "utf8")).trim();
+      if (!Number.isFinite(Date.parse(this.retainedSince))) throw new Error("invalid retention horizon");
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      const created = (await stat(nodePath.dirname(this.dir))).birthtimeMs;
+      // Existing pre-horizon caches may already have pruned history.
+      this.retainedSince = new Date(createdDir ? (created || Date.now()) : Date.now()).toISOString();
+      await writeFile(horizonFile, this.retainedSince + "\n", { mode: 0o600, flag: "wx" });
+    }
     await this.prune();
   }
 
@@ -91,9 +104,15 @@ export class ResultCache {
   async get(requestId: string): Promise<CachedResult | null> {
     if (!ID_RE.test(requestId)) return null;
     try {
-      return JSON.parse(await readFile(this.file(requestId), "utf8")) as CachedResult;
-    } catch {
-      return null;
+      const rec = JSON.parse(await readFile(this.file(requestId), "utf8")) as CachedResult;
+      if (!rec || rec.request_id !== requestId || !["running", "completed", "failed"].includes(rec.state) ||
+          typeof rec.tool !== "string" || !Number.isFinite(Date.parse(rec.started_at))) {
+        throw new Error("invalid cached receipt");
+      }
+      return rec;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err; // Unreadable/corrupt history cannot attest non-receipt.
     }
   }
 
@@ -103,18 +122,36 @@ export class ResultCache {
   }
 
   async prune(): Promise<number> {
+    if (this.pruning) return this.pruning;
+    this.pruning = this.pruneRecords();
+    try { return await this.pruning; }
+    finally { this.pruning = null; }
+  }
+
+  private async pruneRecords(): Promise<number> {
     let n = 0;
     const cutoff = Date.now() - this.retentionMs;
-    for (const name of await readdir(this.dir).catch(() => [] as string[])) {
-      const f = nodePath.join(this.dir, name);
-      try {
-        if ((await stat(f)).mtimeMs < cutoff) {
-          await unlink(f);
-          n++;
-        }
-      } catch {
-        /* raced with another prune */
-      }
+    for (const name of await readdir(this.dir)) {
+      if (!name.endsWith(".json") || !ID_RE.test(name.slice(0, -5))) continue;
+      const id = name.slice(0, -5);
+      await this.mutate(id, async () => {
+        const f = this.file(id);
+        const rec = await this.get(id);
+        if (!rec || rec.state === "running") return;
+        if ((await stat(f)).mtimeMs >= cutoff) return;
+        // Persist the horizon BEFORE removing history. Normally this is the
+        // prune cutoff; handle backdated mtimes conservatively as well.
+        const next = Math.max(Date.parse(this.retainedSince), cutoff, Date.parse(rec.started_at) + 1);
+        if (!Number.isFinite(next)) throw new Error("invalid cached receipt timestamp");
+        const horizon = new Date(next).toISOString();
+        const horizonFile = nodePath.join(this.dir, "retained_since");
+        const tmp = horizonFile + ".tmp";
+        await writeFile(tmp, horizon + "\n", { mode: 0o600 });
+        await rename(tmp, horizonFile);
+        this.retainedSince = horizon;
+        await unlink(f);
+        n++;
+      });
     }
     return n;
   }
